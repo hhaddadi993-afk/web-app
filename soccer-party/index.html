@@ -32,8 +32,9 @@
   </table>
   <p>کلید چپ = حرکت به چپ · کلید راست = حرکت به راست</p>
   <p><b>هر دو کلید با هم = پرش بلند!</b></p>
+  <p><b>شوت:</b> کلید حرکت را نگه دار (نوار قدرت پر می‌شود) و رها کن — هرچه بیشتر نگه داری و سریع‌تر بدوی، شوت محکم‌تر!</p>
   <p>با هر گل، همه‌چیز (جاذبه، توپ، دروازه‌ها، بازیکن‌ها، موانع) رندوم عوض می‌شود. اولین تیمی که ۵ گل بزند برنده است.</p>
-  <p style="opacity:.6;font-size:14px">M = صدا · P = توقف</p>
+  <p style="opacity:.6;font-size:14px">P = توقف</p>
   <div class="go">برای شروع Space یا Enter</div>
 </div></div>
 <script>
@@ -66,42 +67,16 @@ const PLAYERS = [
 ];
 const TEAM = [{ name: 'قرمز', color: '#ff4d5e' }, { name: 'آبی', color: '#3d8bff' }];
 const keys = {};
-let muted = false, paused = false;
+let paused = false;
 addEventListener('keydown', e => {
   if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
   keys[e.code] = true;
-  initAudio();
   if (e.repeat) return;
-  if (e.code === 'KeyM') muted = !muted;
   if (e.code === 'KeyP' && state !== 'menu') paused = !paused;
   if ((e.code === 'Space' || e.code === 'Enter') && (state === 'menu' || state === 'over')) startMatch();
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-
-// ---------- audio ----------
-let actx = null;
-function initAudio() {
-  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
-  if (actx && actx.state === 'suspended') actx.resume();
-}
-function beep(freq, dur, vol, type) {
-  if (!actx || muted) return;
-  const o = actx.createOscillator(), g = actx.createGain();
-  o.type = type || 'sine'; o.frequency.value = freq;
-  g.gain.setValueAtTime(vol, actx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
-  o.connect(g); g.connect(actx.destination);
-  o.start(); o.stop(actx.currentTime + dur);
-}
-let lastHit = 0;
-function hitSound(v, low) {
-  const t = performance.now();
-  if (t - lastHit < 60 || v < 150) return;
-  lastHit = t;
-  beep((low ? 120 : 220) + Math.random() * 60, 0.09, clamp(v / 2500, 0.03, 0.25), 'triangle');
-}
-function goalSound() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, 0.25, 0.2, 'square'), i * 110)); }
 
 // ---------- world ----------
 let state = 'menu';            // menu | play | goal | over
@@ -138,10 +113,10 @@ function newRound() {
     bumpers.push({ x, y: rnd(280, 470), r: rnd(26, 50), vx: 0, vy: 0, invM: 0, static: true });
   }
   players = PLAYERS.map((p, i) => {
-    const r = rnd(22, 44);
+    const r = rnd(30, 52);
     const b = { kind: 'player', i, x: [0.2, 0.35, 0.65, 0.8][i] * W, y: FLOOR - r, r,
       vx: 0, vy: 0, invM: 1 / (r * r), e: 0.05, grounded: false, cd: 0, speed: cfg.speeds[i],
-      look: 0 };
+      look: 0, face: i < 2 ? 1 : -1, charge: 0, prevDir: 0, kick: null, kickHold: 0, phase: 0, foot: null };
     return b;
   });
   ball = { kind: 'ball', x: W / 2 + rnd(-40, 40), y: 180, r: ballR, vx: rnd(-150, 150), vy: 0,
@@ -156,7 +131,7 @@ function newRound() {
   if (cfg.goalH[0] < 200 || cfg.goalH[1] < 200) tags.push('دروازه‌ی کوچک 🥅');
   if (cfg.goalH[0] > 340 || cfg.goalH[1] > 340) tags.push('دروازه‌ی بزرگ 🥅');
   if (nb) tags.push('موانع! 🪨'.replace('🪨', '⭕'));
-  if (players.some(p => p.r > 40)) tags.push('غول‌ها 💪');
+  if (players.some(p => p.r > 48)) tags.push('غول‌ها 💪');
   toast = tags.length ? tags.slice(0, 3).join(' · ') : 'شروع!';
   toastT = 2.6;
 }
@@ -191,7 +166,6 @@ function contactStatic(b, nx, ny, isBall) {
   if (vn < 0) {
     const e = Math.abs(vn) < 90 ? 0 : (isBall ? b.e : 0.05);
     b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny;
-    if (isBall) hitSound(-vn, true);
   }
   if (ny < -0.6) {
     b.grounded = true;
@@ -213,7 +187,6 @@ function collideCircles(a, b) {
     const j = -(1 + e) * vn / im;
     a.vx -= j * nx * a.invM; a.vy -= j * ny * a.invM;
     b.vx += j * nx * b.invM; b.vy += j * ny * b.invM;
-    if (a.kind === 'ball' || b.kind === 'ball') hitSound(-vn, false);
   }
   if (a.kind === 'player' && ny > 0.6) a.grounded = true;   // a is above b
   if (b.kind === 'player' && ny < -0.6) b.grounded = true;
@@ -226,21 +199,61 @@ function collideStaticCircle(b, s) {
   contactStatic(b, nx, ny, b.kind === 'ball');
 }
 
+const CHARGE_T = 0.9, KICK_BACK = -0.75, KICK_SWEEP = 2.7;
+function startKick(p, dir, power) {
+  p.face = dir;
+  p.kick = { t: 0, dur: 0.26 - 0.17 * power, power, dir };
+  p.kickHold = 0;
+}
 function control(dt) {
   for (const p of players) {
     const def = PLAYERS[p.i];
     const l = keys[def.kl], r = keys[def.kr];
-    const dir = (r ? 1 : 0) - (l ? 1 : 0);
+    const both = l && r;
+    const dir = both ? 0 : (r ? 1 : 0) - (l ? 1 : 0);
     p.cd -= dt;
-    if (l && r) {
+    if (both) {
+      p.charge = 0;
       if (p.grounded && p.cd <= 0) { p.vy = -Math.sqrt(2 * gravity * 210); p.cd = 0.4; }
     } else if (dir) {
-      const target = dir * 420 * p.speed, acc = (p.grounded ? 4200 : 1800) * dt;
+      const target = dir * 400 * p.speed, acc = (p.grounded ? 2600 : 1400) * dt;
       p.vx += clamp(target - p.vx, -acc, acc);
-      if (p.grounded && p.cd <= 0) { p.vy = -Math.sqrt(2 * gravity * 55); p.cd = 0.26; }
-      p.look = dir;
+      if (dir !== p.prevDir) p.charge = 0;
+      p.charge = Math.min(CHARGE_T, p.charge + dt);
+      p.face = dir;
     }
+    // releasing (or reversing) a movement key fires the kick; charge decides power
+    if (!both && p.prevDir && dir !== p.prevDir && p.charge > 0.04 && !p.kick) {
+      startKick(p, p.prevDir, clamp(p.charge / CHARGE_T, 0.15, 1));
+    }
+    if (dir !== p.prevDir && dir === 0) p.charge = 0;
+    if (dir !== p.prevDir && dir !== 0 && p.prevDir !== 0) p.charge = 0;
+    p.prevDir = dir;
+    if (p.kick && p.kick.t >= p.kick.dur) { p.kickHold += dt; if (p.kickHold > 0.15) p.kick = null; }
   }
+}
+
+// leg geometry: angle a is measured from straight-down, positive toward `dir`
+function legPose(p, a, len, dir) {
+  const hx = p.x, hy = p.y + p.r * 0.2;
+  return { hx, hy, fx: hx + dir * Math.sin(a) * len, fy: hy + Math.cos(a) * len };
+}
+function kickStep(p, h) {
+  const k = p.kick;
+  if (!k || k.t >= k.dur) return;
+  k.t += h;
+  const u = Math.min(1, k.t / k.dur), a = KICK_BACK + KICK_SWEEP * u, w = KICK_SWEEP / k.dur;
+  const L = p.r * 1.3, fr = p.r * 0.3;
+  const P = legPose(p, a, L, k.dir);
+  const fvx = p.vx + k.dir * Math.cos(a) * L * w, fvy = p.vy - Math.sin(a) * L * w;
+  p.foot = { x: P.fx, y: P.fy };
+  // foot (kinematic, heavy) vs ball
+  const dx = ball.x - P.fx, dy = ball.y - P.fy, rr = ball.r + fr, d2 = dx * dx + dy * dy;
+  if (d2 >= rr * rr) return;
+  const d = Math.sqrt(d2) || 1e-6, nx = dx / d, ny = dy / d;
+  ball.x += nx * (rr - d); ball.y += ny * (rr - d);
+  const vn = (ball.vx - fvx) * nx + (ball.vy - fvy) * ny;
+  if (vn < 0) { const e = 0.95; ball.vx -= (1 + e) * vn * nx; ball.vy -= (1 + e) * vn * ny; }
 }
 
 function step(dt) {
@@ -256,6 +269,7 @@ function step(dt) {
       if (sp > max) { b.vx *= max / sp; b.vy *= max / sp; }
       b.x += b.vx * h; b.y += b.vy * h;
     }
+    for (const p of players) kickStep(p, h);
     for (let it = 0; it < 2; it++) {
       for (let i = 0; i < bodies.length; i++)
         for (let j = i + 1; j < bodies.length; j++) collideCircles(bodies[i], bodies[j]);
@@ -266,6 +280,7 @@ function step(dt) {
     }
   }
   ball.ang += ball.vx / ball.r * dt;
+  for (const p of players) p.phase += Math.abs(p.vx) * dt * 0.045;
   // eyes follow ball
   for (const p of players) if (!(keys[PLAYERS[p.i].kl] || keys[PLAYERS[p.i].kr])) p.look = Math.sign(ball.x - p.x);
 
@@ -280,7 +295,6 @@ function step(dt) {
 function goal(team) {
   scores[team]++;
   lastScorer = team; state = 'goal'; stateT = 0;
-  goalSound();
   toast = 'گل! ' + TEAM[team].name; toastT = 1.6;
 }
 
@@ -321,36 +335,67 @@ function draw() {
     ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 5; ctx.stroke();
   }
 
-  // players
+  // players (stick-figure people)
   for (const p of players) {
-    const def = PLAYERS[p.i];
-    ctx.fillStyle = def.color; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); ctx.stroke();
-    // team ring
-    ctx.strokeStyle = TEAM[def.team].color; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.28, 0, 7); ctx.globalAlpha = 0; ctx.stroke(); ctx.globalAlpha = 1;
-    // eyes
-    const er = p.r * 0.27, ex = p.r * 0.34, ey = -p.r * 0.2;
-    const a = Math.atan2(ball.y - p.y, ball.x - p.x);
-    for (const sx of [-1, 1]) {
-      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p.x + sx * ex, p.y + ey, er, 0, 7); ctx.fill();
-      ctx.fillStyle = '#111'; ctx.beginPath();
-      ctx.arc(p.x + sx * ex + Math.cos(a) * er * 0.45, p.y + ey + Math.sin(a) * er * 0.45, er * 0.5, 0, 7); ctx.fill();
+    const def = PLAYERS[p.i], r = p.r, f = p.face;
+    const moving = Math.abs(p.vx) > 30 && p.grounded;
+    const sw = moving ? Math.sin(p.phase * 2) * 0.6 : 0;
+    const air = p.grounded ? 0 : 0.35;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const limb = (x0, y0, x1, y1, w, col) => { ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); };
+    const hipY = p.y + r * 0.2, shY = p.y - r * 0.12;
+    // legs
+    const k = p.kick;
+    for (const side of [-1, 1]) {
+      let a = side * (sw + air), len = r * 0.8, dir = 1;
+      if (k && side === 1) {
+        const u = Math.min(1, k.t / k.dur);
+        a = KICK_BACK + KICK_SWEEP * u; len = r * 1.3; dir = k.dir;
+      } else if (k) { a = -0.15 * k.dir; dir = 1; }
+      const P = legPose(p, a, len, dir);
+      limb(P.hx, P.hy, P.fx, P.fy, r * 0.24, '#2b2b3a');
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(P.fx, P.fy, r * 0.17, 0, 7); ctx.fill(); ctx.stroke();
     }
-    // mouth
+    // torso + arms
+    limb(p.x, shY, p.x, hipY, r * 0.5, def.color);
+    for (const side of [-1, 1]) {
+      const aa = -side * sw * 0.9 + (p.grounded ? 0 : side * 0.9);
+      limb(p.x, shY + r * 0.05, p.x + Math.sin(aa) * r * 0.6 + side * r * 0.15, shY + r * 0.05 + Math.cos(aa) * r * 0.6, r * 0.17, def.color);
+    }
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(r * 0.42)}px system-ui`; ctx.textAlign = 'center';
+    ctx.fillText(def.name, p.x, p.y + r * 0.05);
+    // head
+    const hr = r * 0.44, hx = p.x, hy = p.y - r * 0.6;
+    ctx.fillStyle = '#ffd9b3'; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(hx, hy, hr, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = def.color; ctx.beginPath(); ctx.arc(hx, hy, hr, Math.PI * 1.08, Math.PI * 1.92); ctx.closePath(); ctx.fill(); // cap
+    const er = hr * 0.3, ex = hr * 0.42, ey = hr * 0.05;
+    const an = Math.atan2(ball.y - hy, ball.x - hx);
+    for (const sx of [-1, 1]) {
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(hx + sx * ex, hy + ey, er, 0, 7); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath();
+      ctx.arc(hx + sx * ex + Math.cos(an) * er * 0.45, hy + ey + Math.sin(an) * er * 0.45, er * 0.5, 0, 7); ctx.fill();
+    }
     let mood = 0;
     if (state === 'goal') mood = def.team === lastScorer ? 1 : -1;
-    ctx.strokeStyle = '#111'; ctx.lineWidth = 3; ctx.beginPath();
-    if (mood >= 0) ctx.arc(p.x, p.y + p.r * 0.15, p.r * 0.32, 0.15, Math.PI - 0.15);
-    else ctx.arc(p.x, p.y + p.r * 0.55, p.r * 0.3, Math.PI + 0.2, -0.2);
+    ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5; ctx.beginPath();
+    if (mood >= 0) ctx.arc(hx, hy + hr * 0.3, hr * 0.32, 0.15, Math.PI - 0.15);
+    else ctx.arc(hx, hy + hr * 0.7, hr * 0.3, Math.PI + 0.2, -0.2);
     ctx.stroke();
+    // power meter
+    if (p.charge > 0.04) {
+      const bw = 46, u = p.charge / CHARGE_T, by = p.y - r - hr * 0.2 - 22;
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(p.x - bw / 2 - 2, by - 2, bw + 4, 10);
+      ctx.fillStyle = `hsl(${60 - 60 * u},95%,55%)`; ctx.fillRect(p.x - bw / 2, by, bw * u, 6);
+    }
     // key hint
     if (roundT < 3 && state !== 'menu') {
-      ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center';
-      const tw = ctx.measureText(def.hint).width + 16;
+      ctx.direction = 'ltr'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center';
+      const tw = ctx.measureText(def.hint).width + 16, ty = p.y - r - 68;
       ctx.fillStyle = 'rgba(0,0,0,.6)';
-      ctx.beginPath(); ctx.roundRect(p.x - tw / 2, p.y - p.r - 36, tw, 26, 8); ctx.fill();
-      ctx.fillStyle = '#fff'; ctx.fillText(def.hint, p.x, p.y - p.r - 17);
+      ctx.beginPath(); ctx.roundRect(p.x - tw / 2, ty, tw, 26, 8); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.fillText(def.hint, p.x, ty + 19); ctx.direction = 'inherit';
     }
   }
 
