@@ -32,14 +32,17 @@
   </table>
   <p>کلید چپ = حرکت به چپ · کلید راست = حرکت به راست</p>
   <p><b>هر دو کلید با هم = پرش بلند!</b></p>
-  <p><b>شوت:</b> کلید حرکت را نگه دار (نوار قدرت پر می‌شود) و رها کن — هرچه بیشتر نگه داری و سریع‌تر بدوی، شوت محکم‌تر!</p>
+  <p><b>شوت:</b> کلید حرکت را نگه دار (نوار قدرت پر می‌شود) و رها کن — پایت شلاقی می‌چرخد؛ هرچه بیشتر نگه داری، شوت محکم‌تر! آدمک‌ها شل و ول‌اند و می‌افتند 😄</p>
   <p>با هر گل، همه‌چیز (جاذبه، توپ، دروازه‌ها، بازیکن‌ها، موانع) رندوم عوض می‌شود. اولین تیمی که ۵ گل بزند برنده است.</p>
   <p style="opacity:.6;font-size:14px">P = توقف</p>
   <div class="go">برای شروع Space یا Enter</div>
 </div></div>
+<script src="matter.min.js"></script>
 <script>
 'use strict';
+const { Engine, Bodies, Body, Composite, Constraint, Query } = Matter;
 const W = 1400, H = 720, FLOOR = 660, GL = 70, WIN_SCORE = 5;
+const D = 1000 / 120, K = 14400 * D * D;   // substep length (ms) and unit helper for forces/torques
 const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
 const menuEl = document.getElementById('menu');
 let scale = 1;
@@ -57,6 +60,7 @@ addEventListener('resize', resize); resize();
 const rnd = (a, b) => a + Math.random() * (b - a);
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const wrap = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
 
 // ---------- input ----------
 const PLAYERS = [
@@ -81,59 +85,82 @@ addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
 // ---------- world ----------
 let state = 'menu';            // menu | play | goal | over
 let scores = [0, 0];
-let bodies = [], ball, players = [], rects = [], bumpers = [], cfg = {};
+let engine, ball, players = [], bumpers = [], cfg = {};
 let stateT = 0, roundT = 0, toast = '', toastT = 0, lastScorer = -1, stuckT = 0, gravity = 1800;
+let allBodies = [];
+
+function makePlayer(i, x) {
+  const hr = rnd(22, 32), legL = hr * 1.7, legW = hr * 0.5, th = hr * 1.5, tw = hr * 1.15;
+  const group = -(i + 1);
+  const filt = { group };
+  const opts = { density: 0.002, friction: 0.6, restitution: 0.1, collisionFilter: filt };
+  const pivotY = FLOOR - legL + legW / 2;
+  const torsoY = pivotY + legW * 0.3 - th / 2;
+  const headY = torsoY - th / 2 - hr * 0.55;
+  const head = Bodies.circle(x, headY, hr, opts);
+  const torso = Bodies.rectangle(x, torsoY, tw, th, { ...opts, chamfer: { radius: tw * 0.3 } });
+  const body = Body.create({ parts: [head, torso], ...opts });
+  const legs = [-1, 1].map(side => {
+    const leg = Bodies.rectangle(x + side * hr * 0.25, FLOOR - legL / 2 - 1, legW, legL, { ...opts, density: 0.008, chamfer: { radius: legW * 0.45 } });
+    const c = Constraint.create({
+      bodyA: body, pointA: { x: side * hr * 0.25, y: pivotY - body.position.y },
+      bodyB: leg, pointB: { x: 0, y: -legL / 2 + legW / 2 }, length: 0, stiffness: 1, damping: 0.1,
+    });
+    return { body: leg, joint: c, side };
+  });
+  const p = { i, body, legs, hr, legL, legW, th, tw, face: i < 2 ? 1 : -1, charge: 0, prevDir: 0, whip: null,
+    cd: 0, speed: cfg.speeds[i], phase: 0, grounded: false, mood: 0 };
+  for (const b of [body, ...legs.map(l => l.body)]) b.plugin.owner = p;
+  Composite.add(engine.world, [body, ...legs.map(l => l.body), ...legs.map(l => l.joint)]);
+  return p;
+}
 
 function newRound() {
   gravity = rnd(700, 2800);
   const ballR = rnd(15, 52);
-  const goalMin = ballR * 2 + 60;
+  const goalMin = Math.max(ballR * 2 + 60, 150);
   cfg = {
-    hue: Math.floor(rnd(0, 360)),
-    ballR,
-    ballE: rnd(0.55, 0.97),
+    hue: Math.floor(rnd(0, 360)), ballR, ballE: rnd(0.55, 0.95),
     ballColor: pick(['#ffffff', '#ffe066', '#ffb3c7', '#b8f2e6', '#e0c3fc']),
-    goalH: [Math.max(goalMin, rnd(150, 400)), Math.max(goalMin, rnd(150, 400))],
-    speeds: PLAYERS.map(() => rnd(0.8, 1.3)),
+    goalH: [Math.max(goalMin, rnd(170, 420)), Math.max(goalMin, rnd(170, 420))],
+    speeds: PLAYERS.map(() => rnd(0.8, 1.25)),
   };
+  engine = Engine.create({ positionIterations: 8, velocityIterations: 6 });
+  engine.gravity.y = gravity / 1000;
+  const wall = (x, y, w, h) => Bodies.rectangle(x, y, w, h, { isStatic: true, friction: 0.7, restitution: 0.3 });
   const gTop = cfg.goalH.map(h => FLOOR - h);
-  rects = [
-    { x: -300, y: FLOOR, w: W + 600, h: 400 },        // floor
-    { x: -300, y: -400, w: W + 600, h: 400 },         // ceiling
-    { x: -300, y: -400, w: 300, h: H + 800 },         // left outer
-    { x: W, y: -400, w: 300, h: H + 800 },            // right outer
-    { x: 0, y: -400, w: GL, h: 400 + gTop[0] },       // left crossbar block
-    { x: W - GL, y: -400, w: GL, h: 400 + gTop[1] },  // right crossbar block
-  ];
+  Composite.add(engine.world, [
+    wall(W / 2, FLOOR + 200, W + 800, 400),
+    wall(W / 2, -200, W + 800, 400),
+    wall(-150, H / 2, 300, H + 800),
+    wall(W + 150, H / 2, 300, H + 800),
+    wall(GL / 2, (gTop[0] - 400) / 2, GL, gTop[0] + 400),
+    wall(W - GL / 2, (gTop[1] - 400) / 2, GL, gTop[1] + 400),
+  ]);
   bumpers = [];
   const nb = pick([0, 0, 1, 2, 3]);
   for (let i = 0; i < nb; i++) {
-    let x;
-    do { x = rnd(300, W - 300); } while (Math.abs(x - W / 2) < 90);
-    bumpers.push({ x, y: rnd(280, 470), r: rnd(26, 50), vx: 0, vy: 0, invM: 0, static: true });
+    let x; do { x = rnd(300, W - 300); } while (Math.abs(x - W / 2) < 90);
+    const b = Bodies.circle(x, rnd(280, 470), rnd(26, 50), { isStatic: true, restitution: 0.8 });
+    bumpers.push(b); Composite.add(engine.world, b);
   }
-  players = PLAYERS.map((p, i) => {
-    const r = rnd(30, 52);
-    const b = { kind: 'player', i, x: [0.2, 0.35, 0.65, 0.8][i] * W, y: FLOOR - r, r,
-      vx: 0, vy: 0, invM: 1 / (r * r), e: 0.05, grounded: false, cd: 0, speed: cfg.speeds[i],
-      look: 0, face: i < 2 ? 1 : -1, charge: 0, prevDir: 0, kick: null, kickHold: 0, phase: 0, foot: null };
-    return b;
-  });
-  ball = { kind: 'ball', x: W / 2 + rnd(-40, 40), y: 180, r: ballR, vx: rnd(-150, 150), vy: 0,
-    invM: 1 / (ballR * ballR * 0.35), e: cfg.ballE, ang: 0 };
-  bodies = [...players, ball];
+  players = PLAYERS.map((p, i) => makePlayer(i, [0.2, 0.35, 0.65, 0.8][i] * W));
+  ball = Bodies.circle(W / 2 + rnd(-40, 40), 180, ballR, { restitution: cfg.ballE, friction: 0.05, frictionAir: 0.002, density: 0.0005 });
+  ball.plugin.isBall = true;
+  Composite.add(engine.world, ball);
+  Body.setVelocity(ball, { x: rnd(-3, 3), y: 0 });
+  allBodies = Composite.allBodies(engine.world);
   roundT = 0; stuckT = 0;
 
   const tags = [];
   if (gravity < 1100) tags.push('جاذبه‌ی ماه 🌙'); else if (gravity > 2200) tags.push('جاذبه‌ی سنگین 🪨');
   if (ballR > 40) tags.push('توپ غول‌آسا 🏀'); else if (ballR < 20) tags.push('توپ ریز 🔹');
-  if (cfg.ballE > 0.9) tags.push('توپ فنری 🐸');
-  if (cfg.goalH[0] < 200 || cfg.goalH[1] < 200) tags.push('دروازه‌ی کوچک 🥅');
-  if (cfg.goalH[0] > 340 || cfg.goalH[1] > 340) tags.push('دروازه‌ی بزرگ 🥅');
-  if (nb) tags.push('موانع! 🪨'.replace('🪨', '⭕'));
-  if (players.some(p => p.r > 48)) tags.push('غول‌ها 💪');
-  toast = tags.length ? tags.slice(0, 3).join(' · ') : 'شروع!';
-  toastT = 2.6;
+  if (cfg.ballE > 0.88) tags.push('توپ فنری 🐸');
+  if (cfg.goalH[0] < 220 || cfg.goalH[1] < 220) tags.push('دروازه‌ی کوچک 🥅');
+  if (cfg.goalH[0] > 350 || cfg.goalH[1] > 350) tags.push('دروازه‌ی بزرگ 🥅');
+  if (nb) tags.push('موانع! ⭕');
+  if (players.some(p => p.hr > 29)) tags.push('کله‌گنده‌ها 🗿');
+  toast = tags.length ? tags.slice(0, 3).join(' · ') : 'شروع!'; toastT = 2.6;
 }
 
 function startMatch() {
@@ -143,68 +170,20 @@ function startMatch() {
   newRound();
 }
 
-// ---------- physics ----------
-function collideRect(b, rc, isBall) {
-  const cx = clamp(b.x, rc.x, rc.x + rc.w), cy = clamp(b.y, rc.y, rc.y + rc.h);
-  let dx = b.x - cx, dy = b.y - cy;
-  const d2 = dx * dx + dy * dy;
-  if (d2 >= b.r * b.r) return;
-  let nx, ny, pen;
-  if (d2 > 1e-9) { const d = Math.sqrt(d2); nx = dx / d; ny = dy / d; pen = b.r - d; }
-  else {
-    const l = b.x - rc.x, r = rc.x + rc.w - b.x, t = b.y - rc.y, bt = rc.y + rc.h - b.y;
-    const m = Math.min(l, r, t, bt);
-    if (m === l) { nx = -1; ny = 0; } else if (m === r) { nx = 1; ny = 0; }
-    else if (m === t) { nx = 0; ny = -1; } else { nx = 0; ny = 1; }
-    pen = m + b.r;
-  }
-  b.x += nx * pen; b.y += ny * pen;
-  contactStatic(b, nx, ny, isBall);
-}
-function contactStatic(b, nx, ny, isBall) {
-  const vn = b.vx * nx + b.vy * ny;
-  if (vn < 0) {
-    const e = Math.abs(vn) < 90 ? 0 : (isBall ? b.e : 0.05);
-    b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny;
-  }
-  if (ny < -0.6) {
-    b.grounded = true;
-    if (isBall) b.vx *= 1 - 0.25 / 480;
-  }
-}
-function collideCircles(a, b) {
-  const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r;
-  const d2 = dx * dx + dy * dy;
-  if (d2 >= rr * rr) return;
-  let d = Math.sqrt(d2), nx, ny;
-  if (d < 1e-6) { nx = 0; ny = -1; d = 0; } else { nx = dx / d; ny = dy / d; }
-  const pen = rr - d, im = a.invM + b.invM;
-  a.x -= nx * pen * a.invM / im; a.y -= ny * pen * a.invM / im;
-  b.x += nx * pen * b.invM / im; b.y += ny * pen * b.invM / im;
-  const vn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
-  if (vn < 0) {
-    const e = Math.abs(vn) < 90 ? 0 : Math.max(a.e || 0, b.e || 0);
-    const j = -(1 + e) * vn / im;
-    a.vx -= j * nx * a.invM; a.vy -= j * ny * a.invM;
-    b.vx += j * nx * b.invM; b.vy += j * ny * b.invM;
-  }
-  if (a.kind === 'player' && ny > 0.6) a.grounded = true;   // a is above b
-  if (b.kind === 'player' && ny < -0.6) b.grounded = true;
-}
-function collideStaticCircle(b, s) {
-  const dx = b.x - s.x, dy = b.y - s.y, rr = b.r + s.r, d2 = dx * dx + dy * dy;
-  if (d2 >= rr * rr) return;
-  const d = Math.sqrt(d2) || 1e-6, nx = dx / d, ny = dy / d;
-  b.x += nx * (rr - d); b.y += ny * (rr - d);
-  contactStatic(b, nx, ny, b.kind === 'ball');
+// ---------- control ----------
+const CHARGE_T = 0.9;
+const V = (b) => { const v = Body.getVelocity(b); return { x: v.x * 60, y: v.y * 60 }; };   // px/s
+const setV = (b, x, y) => Body.setVelocity(b, { x: x / 60, y: y / 60 });
+const AV = (b) => Body.getAngularVelocity(b) * 60;                                           // rad/s
+const torque = (b, alpha) => { b.torque += b.inertia * alpha / K; };
+
+function isGrounded(p) {
+  const bottom = Math.max(...p.legs.map(l => l.body.bounds.max.y));
+  const cx = p.legs[0].body.position.x / 2 + p.legs[1].body.position.x / 2;
+  const hits = Query.region(allBodies, { min: { x: cx - 26, y: bottom - 6 }, max: { x: cx + 26, y: bottom + 6 } });
+  return hits.some(b => b.plugin.owner !== p && !b.plugin.isBall);
 }
 
-const CHARGE_T = 0.9, KICK_BACK = -0.75, KICK_SWEEP = 2.7;
-function startKick(p, dir, power) {
-  p.face = dir;
-  p.kick = { t: 0, dur: 0.26 - 0.17 * power, power, dir };
-  p.kickHold = 0;
-}
 function control(dt) {
   for (const p of players) {
     const def = PLAYERS[p.i];
@@ -212,83 +191,67 @@ function control(dt) {
     const both = l && r;
     const dir = both ? 0 : (r ? 1 : 0) - (l ? 1 : 0);
     p.cd -= dt;
+    p.grounded = isGrounded(p);
+    const v = V(p.body);
     if (both) {
       p.charge = 0;
-      if (p.grounded && p.cd <= 0) { p.vy = -Math.sqrt(2 * gravity * 210); p.cd = 0.4; }
+      if (p.grounded && p.cd <= 0) {
+        const vy = -Math.sqrt(2 * gravity * 200);
+        setV(p.body, v.x, vy); for (const lg of p.legs) setV(lg.body, V(lg.body).x, vy);
+        p.cd = 0.4;
+      }
     } else if (dir) {
-      const target = dir * 400 * p.speed, acc = (p.grounded ? 2600 : 1400) * dt;
-      p.vx += clamp(target - p.vx, -acc, acc);
+      const target = dir * 380 * p.speed, acc = (p.grounded ? 2200 : 900) * dt;
+      const nvx = v.x + clamp(target - v.x, -acc, acc);
+      setV(p.body, nvx, v.y);
+      for (const lg of p.legs) { const lv = V(lg.body); setV(lg.body, lv.x + clamp(target - lv.x, -acc, acc), lv.y); }
       if (dir !== p.prevDir) p.charge = 0;
       p.charge = Math.min(CHARGE_T, p.charge + dt);
       p.face = dir;
+    } else if (p.grounded) {
+      // idle friction
+      const f = 1 - 5 * dt;
+      setV(p.body, v.x * f, v.y);
     }
     // releasing (or reversing) a movement key fires the kick; charge decides power
-    if (!both && p.prevDir && dir !== p.prevDir && p.charge > 0.04 && !p.kick) {
-      startKick(p, p.prevDir, clamp(p.charge / CHARGE_T, 0.15, 1));
+    if (!both && p.prevDir && dir !== p.prevDir && p.charge > 0.04 && !p.whip) {
+      const power = clamp(p.charge / CHARGE_T, 0.15, 1);
+      p.whip = { t: 0.2, dir: p.prevDir, w: 10 + 32 * power };
+      p.face = p.prevDir;
     }
-    if (dir !== p.prevDir && dir === 0) p.charge = 0;
-    if (dir !== p.prevDir && dir !== 0 && p.prevDir !== 0) p.charge = 0;
+    if (dir !== p.prevDir) p.charge = dir && !p.prevDir ? 0 : 0;
     p.prevDir = dir;
-    if (p.kick && p.kick.t >= p.kick.dur) { p.kickHold += dt; if (p.kickHold > 0.15) p.kick = null; }
+    p.phase += Math.abs(v.x) * dt * 0.035;
   }
 }
 
-// leg geometry: angle a is measured from straight-down, positive toward `dir`
-function legPose(p, a, len, dir) {
-  const hx = p.x, hy = p.y + p.r * 0.2;
-  return { hx, hy, fx: hx + dir * Math.sin(a) * len, fy: hy + Math.cos(a) * len };
-}
-function kickStep(p, h) {
-  const k = p.kick;
-  if (!k || k.t >= k.dur) return;
-  k.t += h;
-  const u = Math.min(1, k.t / k.dur), a = KICK_BACK + KICK_SWEEP * u, w = KICK_SWEEP / k.dur;
-  const L = p.r * 1.3, fr = p.r * 0.3;
-  const P = legPose(p, a, L, k.dir);
-  const fvx = p.vx + k.dir * Math.cos(a) * L * w, fvy = p.vy - Math.sin(a) * L * w;
-  p.foot = { x: P.fx, y: P.fy };
-  // foot (kinematic, heavy) vs ball
-  const dx = ball.x - P.fx, dy = ball.y - P.fy, rr = ball.r + fr, d2 = dx * dx + dy * dy;
-  if (d2 >= rr * rr) return;
-  const d = Math.sqrt(d2) || 1e-6, nx = dx / d, ny = dy / d;
-  ball.x += nx * (rr - d); ball.y += ny * (rr - d);
-  const vn = (ball.vx - fvx) * nx + (ball.vy - fvy) * ny;
-  if (vn < 0) { const e = 0.95; ball.vx -= (1 + e) * vn * nx; ball.vy -= (1 + e) * vn * ny; }
-}
-
-function step(dt) {
-  roundT += dt;
-  control(dt);
-  for (const p of players) p.grounded = false;
-  const N = 8, h = dt / N;
-  for (let s = 0; s < N; s++) {
-    for (const b of bodies) {
-      b.vy += gravity * h;
-      if (b.kind === 'player' && b.grounded && !(keys[PLAYERS[b.i].kl] || keys[PLAYERS[b.i].kr])) b.vx *= 1 - 7 * h;
-      const sp = Math.hypot(b.vx, b.vy), max = b.kind === 'ball' ? 2400 : 1600;
-      if (sp > max) { b.vx *= max / sp; b.vy *= max / sp; }
-      b.x += b.vx * h; b.y += b.vy * h;
-    }
-    for (const p of players) kickStep(p, h);
-    for (let it = 0; it < 2; it++) {
-      for (let i = 0; i < bodies.length; i++)
-        for (let j = i + 1; j < bodies.length; j++) collideCircles(bodies[i], bodies[j]);
-      for (const b of bodies) {
-        for (const s2 of bumpers) collideStaticCircle(b, s2);
-        for (const rc of rects) collideRect(b, rc, b.kind === 'ball');
+function motors(dt) {
+  for (const p of players) {
+    const b = p.body;
+    // stay (mostly) upright, but wobble when knocked
+    torque(b, -110 * wrap(b.angle) - 13 * AV(b));
+    const moving = Math.abs(V(b).x) > 40 && p.grounded;
+    const kickIdx = p.face > 0 ? 1 : 0;
+    p.legs.forEach((lg, idx) => {
+      let target = lg.side * 0.1, kp = 700, kd = 45;
+      if (moving) target = Math.sin(p.phase * 2 + (idx ? Math.PI : 0)) * 0.7;
+      if (!p.grounded) target = lg.side * 0.5;
+      if (idx === kickIdx) {
+        if (p.whip && p.whip.t > 0) {
+          const sgn = -p.whip.dir, relNow = wrap(lg.body.angle - b.angle);
+          target = sgn * 1.7; kp = 3000; kd = 60;
+          if (relNow * sgn < 1.6) {   // still sweeping: drive at a constant speed set by the shot power
+            Body.setAngularVelocity(lg.body, (sgn * p.whip.w + AV(b)) / 60);
+            kp = 0; kd = 0;
+          }
+        } else if (p.charge > 0.04) {
+          target = p.face * 1.0 * (p.charge / CHARGE_T); kp = 900;   // wind-up: leg swings back
+        }
       }
-    }
-  }
-  ball.ang += ball.vx / ball.r * dt;
-  for (const p of players) p.phase += Math.abs(p.vx) * dt * 0.045;
-  // eyes follow ball
-  for (const p of players) if (!(keys[PLAYERS[p.i].kl] || keys[PLAYERS[p.i].kr])) p.look = Math.sign(ball.x - p.x);
-
-  if (state === 'play') {
-    if (ball.x < GL) goal(1);
-    else if (ball.x > W - GL) goal(0);
-    if (Math.hypot(ball.vx, ball.vy) < 25) stuckT += dt; else stuckT = 0;
-    if (stuckT > 4) { ball.vy = -900; ball.vx = rnd(-400, 400); stuckT = 0; }
+      const rel = wrap(lg.body.angle - b.angle);
+      torque(lg.body, kp * (target - rel) - kd * (AV(lg.body) - AV(b)));
+    });
+    if (p.whip) { p.whip.t -= dt; if (p.whip.t <= 0) p.whip = null; }
   }
 }
 
@@ -296,131 +259,133 @@ function goal(team) {
   scores[team]++;
   lastScorer = team; state = 'goal'; stateT = 0;
   toast = 'گل! ' + TEAM[team].name; toastT = 1.6;
+  for (const p of players) p.mood = PLAYERS[p.i].team === team ? 1 : -1;
+}
+
+function step(dt) {
+  roundT += dt;
+  control(dt);
+  for (let s = 0; s < 2; s++) { motors(dt / 2); Engine.update(engine, D); }
+  const v = V(ball), sp = Math.hypot(v.x, v.y);
+  if (sp > 2300) setV(ball, v.x * 2300 / sp, v.y * 2300 / sp);
+  for (const p of players) {
+    const pv = V(p.body), ps = Math.hypot(pv.x, pv.y);
+    if (ps > 1500) setV(p.body, pv.x * 1500 / ps, pv.y * 1500 / ps);
+  }
+  const bx = ball.position.x;
+  if (state === 'play') {
+    if (bx < GL) goal(1); else if (bx > W - GL) goal(0);
+    if (sp < 25) stuckT += dt; else stuckT = 0;
+    if (stuckT > 4) { setV(ball, rnd(-400, 400), -900); stuckT = 0; }
+  }
 }
 
 // ---------- drawing ----------
+function poly(b) {
+  const vs = b.vertices; ctx.beginPath(); ctx.moveTo(vs[0].x, vs[0].y);
+  for (let i = 1; i < vs.length; i++) ctx.lineTo(vs[i].x, vs[i].y);
+  ctx.closePath();
+}
 function draw() {
   const hue = cfg.hue || 200;
   const g = ctx.createLinearGradient(0, 0, 0, H);
   g.addColorStop(0, `hsl(${hue},60%,72%)`); g.addColorStop(1, `hsl(${hue},55%,52%)`);
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-
-  // ground
   ctx.fillStyle = `hsl(${(hue + 120) % 360},45%,32%)`; ctx.fillRect(0, FLOOR, W, H - FLOOR);
   ctx.fillStyle = `hsl(${(hue + 120) % 360},50%,45%)`; ctx.fillRect(0, FLOOR, W, 10);
-  // center line
   ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 4;
   ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, FLOOR); ctx.stroke();
 
-  // goals
   for (let s = 0; s < 2; s++) {
-    const gh = (cfg.goalH || [250, 250])[s], top = FLOOR - gh;
-    const x0 = s === 0 ? 0 : W - GL;
+    const gh = (cfg.goalH || [250, 250])[s], top = FLOOR - gh, x0 = s === 0 ? 0 : W - GL;
     ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(x0, top, GL, gh);
     ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 2;
     for (let x = x0; x <= x0 + GL; x += 14) { ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, FLOOR); ctx.stroke(); }
     for (let y = top; y <= FLOOR; y += 14) { ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + GL, y); ctx.stroke(); }
-    ctx.fillStyle = '#f4f4f4'; ctx.fillRect(x0, 0, GL, top);                      // crossbar block
     ctx.fillStyle = TEAM[s].color; ctx.fillRect(x0, 0, GL, top);
     ctx.fillStyle = 'rgba(255,255,255,.45)'; ctx.fillRect(x0, 0, GL, top);
-    ctx.fillStyle = '#fff'; ctx.fillRect(s === 0 ? GL - 10 : x0, top - 12, 10, 12 + gh); // post
-    ctx.fillRect(x0, top - 12, GL, 12);
+    ctx.fillStyle = '#fff'; ctx.fillRect(s === 0 ? GL - 10 : x0, top - 12, 10, 12 + gh); ctx.fillRect(x0, top - 12, GL, 12);
   }
-  // walls
-  ctx.fillStyle = '#222'; ctx.fillRect(0, 0, 0, 0);
-
-  // bumpers
   for (const b of bumpers) {
-    ctx.fillStyle = '#3a3a48'; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+    ctx.fillStyle = '#3a3a48'; ctx.beginPath(); ctx.arc(b.position.x, b.position.y, b.circleRadius, 0, 7); ctx.fill();
     ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 5; ctx.stroke();
   }
 
-  // players (stick-figure people)
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   for (const p of players) {
-    const def = PLAYERS[p.i], r = p.r, f = p.face;
-    const moving = Math.abs(p.vx) > 30 && p.grounded;
-    const sw = moving ? Math.sin(p.phase * 2) * 0.6 : 0;
-    const air = p.grounded ? 0 : 0.35;
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    const limb = (x0, y0, x1, y1, w, col) => { ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); };
-    const hipY = p.y + r * 0.2, shY = p.y - r * 0.12;
+    const def = PLAYERS[p.i], b = p.body, hr = p.hr;
+    const head = b.parts[1], torso = b.parts[2];
     // legs
-    const k = p.kick;
-    for (const side of [-1, 1]) {
-      let a = side * (sw + air), len = r * 0.8, dir = 1;
-      if (k && side === 1) {
-        const u = Math.min(1, k.t / k.dur);
-        a = KICK_BACK + KICK_SWEEP * u; len = r * 1.3; dir = k.dir;
-      } else if (k) { a = -0.15 * k.dir; dir = 1; }
-      const P = legPose(p, a, len, dir);
-      limb(P.hx, P.hy, P.fx, P.fy, r * 0.24, '#2b2b3a');
-      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(P.fx, P.fy, r * 0.17, 0, 7); ctx.fill(); ctx.stroke();
+    for (const lg of p.legs) {
+      poly(lg.body); ctx.fillStyle = '#2b2b3a'; ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 2; ctx.stroke();
+      const a = lg.body.angle, ox = -Math.sin(a) * (p.legL / 2 - p.legW * 0.35), oy = Math.cos(a) * (p.legL / 2 - p.legW * 0.35);
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(lg.body.position.x + ox, lg.body.position.y + oy, p.legW * 0.62, 0, 7); ctx.fill(); ctx.stroke();
     }
-    // torso + arms
-    limb(p.x, shY, p.x, hipY, r * 0.5, def.color);
+    // arms (swing opposite to legs)
+    const moving = Math.abs(V(b).x) > 40;
+    const sh = { x: torso.position.x - Math.sin(b.angle) * p.th * 0.3, y: torso.position.y - Math.cos(b.angle) * p.th * 0.3 };
     for (const side of [-1, 1]) {
-      const aa = -side * sw * 0.9 + (p.grounded ? 0 : side * 0.9);
-      limb(p.x, shY + r * 0.05, p.x + Math.sin(aa) * r * 0.6 + side * r * 0.15, shY + r * 0.05 + Math.cos(aa) * r * 0.6, r * 0.17, def.color);
+      const aa = b.angle + (moving ? -side * Math.sin(p.phase * 2) * 0.9 : 0) + (p.grounded ? side * 0.15 : side * 1.1);
+      ctx.strokeStyle = def.color; ctx.lineWidth = hr * 0.3;
+      ctx.beginPath(); ctx.moveTo(sh.x, sh.y);
+      ctx.lineTo(sh.x - Math.sin(aa) * hr * 1.4 + side * hr * 0.3, sh.y + Math.cos(aa) * hr * 1.4); ctx.stroke();
     }
-    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(r * 0.42)}px system-ui`; ctx.textAlign = 'center';
-    ctx.fillText(def.name, p.x, p.y + r * 0.05);
+    // torso
+    poly(torso); ctx.fillStyle = def.color; ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.save(); ctx.translate(torso.position.x, torso.position.y); ctx.rotate(b.angle);
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(hr * 0.8)}px system-ui`; ctx.textAlign = 'center'; ctx.fillText(def.name, 0, hr * 0.28);
+    ctx.restore();
     // head
-    const hr = r * 0.44, hx = p.x, hy = p.y - r * 0.6;
+    ctx.save(); ctx.translate(head.position.x, head.position.y); ctx.rotate(b.angle);
     ctx.fillStyle = '#ffd9b3'; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(hx, hy, hr, 0, 7); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = def.color; ctx.beginPath(); ctx.arc(hx, hy, hr, Math.PI * 1.08, Math.PI * 1.92); ctx.closePath(); ctx.fill(); // cap
-    const er = hr * 0.3, ex = hr * 0.42, ey = hr * 0.05;
-    const an = Math.atan2(ball.y - hy, ball.x - hx);
+    ctx.beginPath(); ctx.arc(0, 0, hr, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = def.color; ctx.beginPath(); ctx.arc(0, 0, hr, Math.PI * 1.05, Math.PI * 1.95); ctx.closePath(); ctx.fill();
+    const er = hr * 0.27, ex = hr * 0.4, ey = hr * 0.08;
+    const an = Math.atan2(ball.position.y - head.position.y, ball.position.x - head.position.x) - b.angle;
     for (const sx of [-1, 1]) {
-      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(hx + sx * ex, hy + ey, er, 0, 7); ctx.fill();
-      ctx.fillStyle = '#111'; ctx.beginPath();
-      ctx.arc(hx + sx * ex + Math.cos(an) * er * 0.45, hy + ey + Math.sin(an) * er * 0.45, er * 0.5, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(sx * ex, ey, er, 0, 7); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(sx * ex + Math.cos(an) * er * 0.45, ey + Math.sin(an) * er * 0.45, er * 0.5, 0, 7); ctx.fill();
     }
-    let mood = 0;
-    if (state === 'goal') mood = def.team === lastScorer ? 1 : -1;
     ctx.strokeStyle = '#111'; ctx.lineWidth = 2.5; ctx.beginPath();
-    if (mood >= 0) ctx.arc(hx, hy + hr * 0.3, hr * 0.32, 0.15, Math.PI - 0.15);
-    else ctx.arc(hx, hy + hr * 0.7, hr * 0.3, Math.PI + 0.2, -0.2);
+    const mood = state === 'goal' ? p.mood : 0;
+    if (mood >= 0) ctx.arc(0, hr * 0.32, hr * 0.32, 0.15, Math.PI - 0.15); else ctx.arc(0, hr * 0.72, hr * 0.3, Math.PI + 0.2, -0.2);
     ctx.stroke();
-    // power meter
+    ctx.restore();
+    // power meter + hint
+    const top = head.position.y - hr;
     if (p.charge > 0.04) {
-      const bw = 46, u = p.charge / CHARGE_T, by = p.y - r - hr * 0.2 - 22;
-      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(p.x - bw / 2 - 2, by - 2, bw + 4, 10);
-      ctx.fillStyle = `hsl(${60 - 60 * u},95%,55%)`; ctx.fillRect(p.x - bw / 2, by, bw * u, 6);
+      const bw = 46, u = p.charge / CHARGE_T, by = top - 18;
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(head.position.x - bw / 2 - 2, by - 2, bw + 4, 10);
+      ctx.fillStyle = `hsl(${60 - 60 * u},95%,55%)`; ctx.fillRect(head.position.x - bw / 2, by, bw * u, 6);
     }
-    // key hint
     if (roundT < 3 && state !== 'menu') {
       ctx.direction = 'ltr'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'center';
-      const tw = ctx.measureText(def.hint).width + 16, ty = p.y - r - 68;
-      ctx.fillStyle = 'rgba(0,0,0,.6)';
-      ctx.beginPath(); ctx.roundRect(p.x - tw / 2, ty, tw, 26, 8); ctx.fill();
-      ctx.fillStyle = '#fff'; ctx.fillText(def.hint, p.x, ty + 19); ctx.direction = 'inherit';
+      const tw = ctx.measureText(def.hint).width + 16, ty = top - 50;
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.beginPath(); ctx.roundRect(head.position.x - tw / 2, ty, tw, 26, 8); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.fillText(def.hint, head.position.x, ty + 19); ctx.direction = 'inherit';
     }
   }
 
   // ball
   if (ball) {
-    ctx.save(); ctx.translate(ball.x, ball.y); ctx.rotate(ball.ang);
+    const r = ball.circleRadius;
+    ctx.save(); ctx.translate(ball.position.x, ball.position.y); ctx.rotate(ball.angle);
     ctx.fillStyle = cfg.ballColor; ctx.strokeStyle = '#111'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill(); ctx.stroke();
     ctx.fillStyle = '#111'; ctx.beginPath();
-    for (let i = 0; i < 5; i++) { const t = i / 5 * Math.PI * 2; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(t) * ball.r * 0.38, Math.sin(t) * ball.r * 0.38); }
-    ctx.closePath(); ctx.fill();
-    ctx.lineWidth = 2;
+    for (let i = 0; i < 5; i++) { const t = i / 5 * Math.PI * 2; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(t) * r * 0.38, Math.sin(t) * r * 0.38); }
+    ctx.closePath(); ctx.fill(); ctx.lineWidth = 2;
     for (let i = 0; i < 5; i++) { const t = i / 5 * Math.PI * 2; ctx.beginPath();
-      ctx.moveTo(Math.cos(t) * ball.r * 0.38, Math.sin(t) * ball.r * 0.38); ctx.lineTo(Math.cos(t) * ball.r * 0.95, Math.sin(t) * ball.r * 0.95); ctx.stroke(); }
+      ctx.moveTo(Math.cos(t) * r * 0.38, Math.sin(t) * r * 0.38); ctx.lineTo(Math.cos(t) * r * 0.95, Math.sin(t) * r * 0.95); ctx.stroke(); }
     ctx.restore();
   }
 
   // HUD
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 64px system-ui'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+  ctx.textAlign = 'center'; ctx.font = 'bold 64px system-ui'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.5)';
   const sc = [String(scores[0]), String(scores[1])];
   ctx.fillStyle = TEAM[0].color; ctx.strokeText(sc[0], W / 2 - 60, 80); ctx.fillText(sc[0], W / 2 - 60, 80);
   ctx.fillStyle = '#fff'; ctx.strokeText(':', W / 2, 76); ctx.fillText(':', W / 2, 76);
   ctx.fillStyle = TEAM[1].color; ctx.strokeText(sc[1], W / 2 + 60, 80); ctx.fillText(sc[1], W / 2 + 60, 80);
-
   if (toastT > 0) {
     ctx.font = 'bold 40px system-ui'; ctx.lineWidth = 8; ctx.strokeStyle = 'rgba(0,0,0,.6)';
     ctx.fillStyle = state === 'goal' ? TEAM[lastScorer].color : '#fff';
@@ -430,8 +395,7 @@ function draw() {
     ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = TEAM[lastScorer].color; ctx.font = 'bold 80px system-ui';
     ctx.fillText('تیم ' + TEAM[lastScorer].name + ' برنده شد! 🏆', W / 2, H / 2 - 10);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 32px system-ui';
-    ctx.fillText('برای بازی جدید Space یا Enter', W / 2, H / 2 + 60);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 32px system-ui'; ctx.fillText('برای بازی جدید Space یا Enter', W / 2, H / 2 + 60);
   }
   if (paused) {
     ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0, 0, W, H);
@@ -443,7 +407,7 @@ function draw() {
 let last = performance.now(), acc = 0;
 function frame(now) {
   requestAnimationFrame(frame);
-  let dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
   if (!paused && state !== 'menu') {
     acc += dt;
     while (acc >= 1 / 60) {
@@ -451,18 +415,18 @@ function frame(now) {
       if (state === 'goal') {
         stateT += 1 / 60;
         if (stateT > 1.6) {
-          if (scores[lastScorer] >= WIN_SCORE) { state = 'over'; }
+          if (scores[lastScorer] >= WIN_SCORE) state = 'over';
           else { state = 'play'; newRound(); }
         }
       }
     }
     if (toastT > 0) toastT -= dt;
-  }
+  } else if (state === 'menu') { /* static preview */ }
   draw();
 }
-newRound();   // background preview behind the menu
+newRound();
 requestAnimationFrame(frame);
-window.__game = { get state() { return state; }, get scores() { return scores; }, get ball() { return ball; }, get players() { return players; }, keys };
+window.__game = { get state() { return state; }, get scores() { return scores; }, get ball() { return ball; }, get players() { return players; }, keys, V, step, newRound };
 </script>
 </body>
 </html>
