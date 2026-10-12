@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mainMenu>
+  <menuBar>
+
+    <subMenu id="my_tools_menu">
+      <label>My Tools</label>
+
+      <scriptItem id="my_tools_load_abc_clipboard">
+        <label>Load ABC from Clipboard (Unpack + 0.01)</label>
+        <scriptCode><![CDATA[
+import os
+import hou
+
+SCALE = 0.01
+
+def _clean_path(text):
+    if not text:
+        return ''
+    p = text.strip().splitlines()[0].strip().strip('"').strip("'")
+    if p.lower().startswith('file:///'):
+        p = p[8:]
+    return p.replace('\\', '/')
+
+def _load_abc_from_clipboard():
+    path = _clean_path(hou.ui.getTextFromClipboard())
+
+    if not path.lower().endswith('.abc'):
+        hou.ui.displayMessage('Clipboard is not an Alembic path:\n%s' % path,
+                              severity=hou.severityType.Error)
+        return
+    if not os.path.isfile(path):
+        hou.ui.displayMessage('File not found:\n%s' % path,
+                              severity=hou.severityType.Error)
+        return
+
+    name = os.path.splitext(os.path.basename(path))[0]
+    safe = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
+    if safe and safe[0].isdigit():
+        safe = '_' + safe
+
+    geo = hou.node('/obj').createNode('geo', node_name=safe or 'abc_import')
+
+    abc = geo.createNode('alembic', 'alembic_in')
+    abc.parm('fileName').set(path)
+
+    unpack = geo.createNode('unpack', 'unpack')
+    unpack.setInput(0, abc)
+
+    xform = geo.createNode('xform', 'scale_0_01')
+    xform.setInput(0, unpack)
+    xform.parm('scale').set(SCALE)
+
+    out = geo.createNode('null', 'OUT')
+    out.setInput(0, xform)
+    out.setDisplayFlag(True)
+    out.setRenderFlag(True)
+
+    geo.layoutChildren()
+    geo.setSelected(True, clear_all_selected=True)
+    print('Loaded: %s  (scale %s)' % (path, SCALE))
+
+_load_abc_from_clipboard()
+]]></scriptCode>
+      </scriptItem>
+
+      <separatorItem/>
+
+      <scriptItem id="my_tools_save_hip_clipboard">
+        <label>Save HIP to Clipboard Path</label>
+        <scriptCode><![CDATA[
+import os, re, hou
+
+def _clipboard_text():
+    txt = ""
+    try:
+        txt = hou.ui.getTextFromClipboard() or ""
+    except Exception:
+        pass
+    if not txt:
+        try:
+            from PySide2 import QtWidgets
+            txt = QtWidgets.QApplication.clipboard().text() or ""
+        except Exception:
+            pass
+    if not txt.strip():
+        return ""
+    p = txt.strip().splitlines()[0].strip().strip('"').strip("'")
+    if p.lower().startswith("file:///"):
+        p = p[8:]
+    return p
+
+def _hip_ext():
+    lic = hou.licenseCategory()
+    if lic == hou.licenseCategoryType.Apprentice:
+        return ".hipnc"
+    if lic == hou.licenseCategoryType.Indie:
+        return ".hiplc"
+    return ".hip"
+
+def _shot_name(folder):
+    parts = folder.replace("\\", "/").rstrip("/").split("/")
+    for p in reversed(parts):
+        if re.match(r"(?i)^shot", p):
+            return p
+    # fallback: parent of from_maya / hair_sim
+    for p in reversed(parts):
+        if p.lower() not in ("from_maya", "hair_sim", ""):
+            return p
+    return "shot"
+
+def _next_version(folder, base, ext):
+    rx = re.compile(r"^" + re.escape(base) + r"_v(\d+)\.hip(nc|lc)?$", re.IGNORECASE)
+    hi = 0
+    for f in os.listdir(folder):
+        m = rx.match(f)
+        if m:
+            hi = max(hi, int(m.group(1)))
+    return "{0}_v{1:03d}{2}".format(base, hi + 1, ext)
+
+def run():
+    path = _clipboard_text()
+    if not path:
+        hou.ui.displayMessage("Clipboard is empty.\nCopy the from_maya folder path first.",
+                              severity=hou.severityType.Warning)
+        return
+
+    path = os.path.normpath(path)
+    folder = os.path.dirname(path) if os.path.splitext(path)[1] else path
+
+    if not os.path.isdir(folder):
+        if hou.ui.displayMessage("Folder does not exist:\n\n" + folder + "\n\nCreate it?",
+                                 buttons=("Create", "Cancel"), default_choice=0,
+                                 close_choice=1) != 0:
+            return
+        os.makedirs(folder)
+
+    base = _shot_name(folder) + "_hair_sim"
+    suggested = _next_version(folder, base, _hip_ext())
+
+    btn, name = hou.ui.readInput(
+        "Save the current scene into:\n\n" + folder + "\n\nFile name:",
+        buttons=("Save", "Cancel"), default_choice=0, close_choice=1,
+        initial_contents=suggested, title="Save HIP to Clipboard Path")
+    if btn != 0 or not name.strip():
+        return
+
+    name = name.strip()
+    if not re.search(r"\.hip(nc|lc)?$", name, re.IGNORECASE):
+        name += _hip_ext()
+    target = os.path.join(folder, name)
+
+    if os.path.exists(target):
+        if hou.ui.displayMessage("File already exists:\n\n" + target + "\n\nOverwrite?",
+                                 buttons=("Overwrite", "Cancel"), default_choice=1,
+                                 close_choice=1, severity=hou.severityType.Warning) != 0:
+            return
+
+    hou.hipFile.save(file_name=target.replace("\\", "/"))
+    hou.ui.setStatusMessage("Saved: " + target, severity=hou.severityType.Message)
+    print("[My Tools] Saved HIP: " + target)
+
+run()
+]]></scriptCode>
+      </scriptItem>
+
+      <separatorItem/>
+
+      <scriptItem id="my_tools_batch_hair_sim">
+        <label>Batch Hair Sim: Setup SETUP_RUN</label>
+        <scriptCode><![CDATA[
+import re
+import hou
+
+CTRL_DEFAULT = "/obj/alembic_import_all/SETUP_RUN"
+ABC_NODE_DEFAULT = "/obj/alembic_import_all/wildebeest_a_lo_wildebeest_lodB_geo"
+SIM_DEFAULT = "filecache_tail_static filecache_beard_static filecache_mane_static"
+EXPORT_DEFAULT = "rop_mane_static rop_beard_static rop_tail_static"
+SESSION_SRC = '# >>> HAIR_BATCH  (installed by My Tools > Batch Hair Sim - do not edit between these markers)\nimport os as _hb_os\nimport fnmatch as _hb_fnmatch\n\n\ndef _hb_expand(s):\n    try:\n        return hou.text.expandString(s)\n    except AttributeError:\n        return hou.expandString(s)\n\n\ndef _hb_list_chars(ctrl):\n    folder = ctrl.evalParm("abc_folder")\n    if not _hb_os.path.isdir(folder):\n        return []\n    return sorted(_hb_os.path.splitext(f)[0] for f in _hb_os.listdir(folder)\n                  if f.lower().endswith(".abc"))\n\n\ndef hb_char_menu(kwargs):\n    items = []\n    for c in _hb_list_chars(kwargs["node"]):\n        items += [c, c]\n    return items or ["", "(no .abc found in folder)"]\n\n\ndef _hb_part(node):\n    n = node.name()\n    for p in ("filecache_", "rop_", "cache_"):\n        if n.startswith(p):\n            n = n[len(p):]\n    for s in ("_static",):\n        if n.endswith(s):\n            n = n[:-len(s)]\n    return n\n\n\ndef _hb_nodes(ctrl, parm_name):\n    out = []\n    for name in ctrl.evalParm(parm_name).split():\n        n = ctrl.node("../" + name) or hou.node(name)\n        if n is None:\n            raise RuntimeError("Node not found: " + name)\n        out.append(n)\n    return out\n\n\ndef _hb_set_menu(parm, token):\n    try:\n        parm.set(token)\n    except Exception:\n        pass\n\n\ndef hb_wire(kwargs):\n    """Point alembic / sim caches / export ROPs at the SETUP_RUN parameters."""\n    ctrl = kwargs["node"]\n    c = ctrl.path()\n    ch = lambda p: \'`chs("{0}/{1}")`\'.format(c, p)\n    report = []\n\n    abc = hou.node(ctrl.evalParm("abc_node"))\n    if abc is None or abc.parm("fileName") is None:\n        raise RuntimeError("Alembic node not found (or has no fileName): " + ctrl.evalParm("abc_node"))\n    if abc.path() == ctrl.path():\n        raise RuntimeError("\'Alembic SOP\' points to SETUP_RUN itself - set it to the Alembic node")\n    # built directly from folder + char (no chained reference -> no recursion)\n    abc.parm("fileName").set("{0}/{1}.abc".format(ch("abc_folder"), ch("char")))\n    report.append(abc.name() + "  <-  abc_folder/char.abc")\n\n    for n in _hb_nodes(ctrl, "sim_nodes"):\n        part = _hb_part(n)\n        if n.parm("basedir") is not None:              # File Cache 2.0 (constructed)\n            if n.parm("filemethod") is not None:\n                _hb_set_menu(n.parm("filemethod"), "constructed")\n            n.parm("basedir").set("{0}/{1}".format(ch("cache_root"), ch("char")))\n            n.parm("basename").set(part)\n        elif n.parm("file") is not None:               # old File Cache\n            n.parm("file").set("{0}/{1}/{2}/{2}.$F4.bgeo.sc".format(ch("cache_root"), ch("char"), part))\n        else:\n            raise RuntimeError("Unknown cache node type: " + n.path())\n        report.append("{0}  ->  cache/<char>/{1}/".format(n.name(), part))\n\n    for n in _hb_nodes(ctrl, "export_nodes"):\n        part = _hb_part(n)\n        path = "{0}/{1}/{2}.abc".format(ch("export_root"), ch("char"), part)\n        for pn in ("filename", "sopoutput", "file"):\n            if n.parm(pn) is not None:\n                n.parm(pn).set(path)\n                break\n        else:\n            raise RuntimeError("No output path parm on: " + n.path())\n        report.append("{0}  ->  from_houdini/<char>/{1}.abc".format(n.name(), part))\n    report += _hb_wire_frames(ctrl)\n    return report\n\n\ndef _hb_set_range_mode(n):\n    p = n.parm("trange")\n    if p is None:\n        return\n    for v in ("normal", 1):\n        try:\n            p.set(v)\n            return\n        except Exception:\n            pass\n\n\ndef _hb_try_expr(n, pname, expr, report, label):\n    """Set an expression; skip (and report) parms that are locked or inside a locked asset."""\n    p = n.parm(pname)\n    if p is None:\n        return False\n    try:\n        p.setExpression(expr, hou.exprLanguage.Hscript)\n        return True\n    except hou.PermissionError:\n        report.append("{0}: {1} is locked (skipped)".format(n.path(), label))\n    except Exception as e:\n        report.append("{0}: {1} not set ({2})".format(n.path(), label, e))\n    return False\n\n\ndef _hb_wire_frames(ctrl):\n    """Point every cache / ROP / vellum solver at SETUP_RUN start_frame / end_frame."""\n    if ctrl.parm("start_frame") is None:\n        return []\n    c = ctrl.path()\n    fs = \'ch("{0}/start_frame")\'.format(c)\n    fe = \'ch("{0}/end_frame")\'.format(c)\n    report = []\n    for parm_name in ("sim_nodes", "export_nodes"):\n        for n in _hb_nodes(ctrl, parm_name):\n            if n.parm("f1") is None:\n                report.append("{0}: no frame range parm (skipped)".format(n.name()))\n                continue\n            _hb_set_range_mode(n)\n            ok1 = _hb_try_expr(n, "f1", fs, report, "start frame")\n            ok2 = _hb_try_expr(n, "f2", fe, report, "end frame")\n            if n.parm("f3") is not None:\n                try:\n                    n.parm("f3").deleteAllKeyframes()\n                    n.parm("f3").set(1)\n                except Exception:\n                    pass\n            if ok1 and ok2:\n                report.append("{0}: frames from SETUP_RUN".format(n.name()))\n\n    if ctrl.evalParm("set_solver_start"):\n        for n in ctrl.parent().allSubChildren():\n            if "vellumsolver" not in n.type().name().lower() or n.parm("startframe") is None:\n                continue\n            # solvers that live inside a locked asset (e.g. inside a vellum HDA) can\'t be edited\n            if n.isInsideLockedHDA():\n                continue\n            if _hb_try_expr(n, "startframe", fs, report, "sim start frame"):\n                report.append("{0}: sim start frame from SETUP_RUN".format(n.name()))\n\n    if ctrl.evalParm("set_timeline"):\n        a, b = ctrl.evalParm("start_frame"), ctrl.evalParm("end_frame")\n        try:\n            hou.playbar.setFrameRange(a, b)\n            hou.playbar.setPlaybackRange(a, b)\n            report.append("timeline: {0}-{1}".format(int(a), int(b)))\n        except Exception:\n            pass\n    return report\n\n\ndef hb_frames_from_timeline(kwargs):\n    ctrl = kwargs["node"]\n    a, b = hou.playbar.frameRange()\n    ctrl.parm("start_frame").set(a)\n    ctrl.parm("end_frame").set(b)\n\n\ndef hb_apply_frames(kwargs):\n    rep = _hb_wire_frames(kwargs["node"])\n    _hb_status(kwargs["node"], "Frame range applied to {0} node(s)".format(len(rep)))\n\n\ndef _hb_out_parm(n):\n    for pn in ("filename", "sopoutput", "file"):\n        if n.parm(pn) is not None:\n            return n.parm(pn)\n    return None\n\n\ndef _hb_execute(n):\n    if isinstance(n, hou.RopNode):\n        n.render(verbose=False, output_progress=False)\n    elif n.parm("execute") is not None:\n        n.parm("execute").pressButton()\n    else:\n        raise RuntimeError("Cannot run " + n.path())\n\n\ndef _hb_status(ctrl, text):\n    p = ctrl.parm("status")\n    if p is not None:\n        try:\n            p.set(text)\n        except Exception:\n            pass\n    print("[Batch Hair] " + text)\n\n\ndef _hb_frames(ctrl):\n    if ctrl.parm("start_frame") is not None:\n        return int(ctrl.evalParm("start_frame")), int(ctrl.evalParm("end_frame"))\n    a, b = hou.playbar.frameRange()\n    return int(a), int(b)\n\n\ndef _hb_path_at(n, frame):\n    for pn in ("sopoutput", "file", "filename"):\n        p = n.parm(pn)\n        if p is not None:\n            try:\n                v = p.evalAtFrame(frame)\n            except Exception:\n                continue\n            if v:\n                return v.replace("\\\\", "/")\n    return ""\n\n\ndef _hb_cache_missing(n, a, b):\n    """Return the first missing cache file (start / middle / end frame), or \'\' if all exist."""\n    for f in sorted({a, (a + b) // 2, b}):\n        path = _hb_path_at(n, f)\n        if not path or not _hb_os.path.isfile(path):\n            return path or "(no path on {0})".format(n.name())\n    return ""\n\n\ndef _hb_source_cache(rop, sims):\n    """The sim cache this ROP must read from: same part name, else any cache above it."""\n    above = set(x.path() for x in rop.inputAncestors())\n    part = _hb_part(rop)\n    same = [s for s in sims if _hb_part(s) == part]\n    for s in same + sims:\n        if s.path() in above:\n            return s, True\n    return (same[0] if same else None), False\n\n\ndef _hb_is_direct(ctrl):\n    p = ctrl.parm("run_mode")\n    return p is not None and p.evalAsString() == "direct"\n\n\ndef _hb_set_bypass(n, state):\n    try:\n        n.bypass(state)\n    except Exception:\n        pass\n\n\ndef _hb_run_char_direct(ctrl, char, sims, exps, op, idx, total):\n    """No sim cache: File Caches are bypassed, each ROP simulates and writes the alembic in one pass.\n    The original bypass state of the File Caches is restored afterwards."""\n    saved = []\n    for n in sims:\n        try:\n            saved.append((n, n.isBypassed()))\n        except Exception:\n            pass\n        if n.parm("loadfromdisk") is not None:\n            try:\n                n.parm("loadfromdisk").set(0)     # never read an old cache\n            except Exception:\n                pass\n        _hb_set_bypass(n, True)                   # passes the live sim straight through\n    try:\n        for i, n in enumerate(exps):\n            if op is not None:\n                op.updateProgress(float(i) / len(exps))\n            _hb_status(ctrl, "RUNNING  {0}  ({1}/{2})   step {3}/{4}  SIM+EXPORT  {5}".format(\n                char, idx, total, i + 1, len(exps), n.name()))\n            out = _hb_out_parm(n)\n            if out is not None:\n                d = _hb_os.path.dirname(out.eval())\n                if d and not _hb_os.path.isdir(d):\n                    _hb_os.makedirs(d)\n            _hb_execute(n)\n            path = out.eval() if out is not None else ""\n            if path and not _hb_os.path.isfile(path):\n                raise RuntimeError("{0}: alembic was not written ({1})".format(n.name(), path))\n    finally:\n        for n, was in saved:\n            _hb_set_bypass(n, was)\n\n\ndef _hb_run_char(ctrl, char, op=None, idx=1, total=1):\n    ctrl.parm("char").set(char)\n    sims = _hb_nodes(ctrl, "sim_nodes")\n    exps = _hb_nodes(ctrl, "export_nodes")\n    fa, fb = _hb_frames(ctrl)\n    abc_file = _hb_os.path.join(ctrl.evalParm("abc_folder"), char + ".abc").replace("\\\\", "/")\n    if not _hb_os.path.isfile(abc_file):\n        raise RuntimeError("Alembic not found: " + abc_file)\n\n    if _hb_is_direct(ctrl):\n        _hb_run_char_direct(ctrl, char, sims, exps, op, idx, total)\n        return\n    for n in sims:\n        _hb_set_bypass(n, False)\n\n    # every ROP must sit below its sim cache, otherwise it would re-simulate\n    for rop in exps:\n        src, connected = _hb_source_cache(rop, sims)\n        if not connected:\n            raise RuntimeError("{0} is not connected below {1} - it would re-simulate instead "\n                               "of reading the cache. Connect it under the File Cache."\n                               .format(rop.name(), src.name() if src else "any sim cache"))\n\n    skip = ctrl.parm("skip_cached") is not None and ctrl.evalParm("skip_cached")\n    steps = sims + exps\n    for i, n in enumerate(steps):\n        if op is not None:\n            op.updateProgress(float(i) / len(steps))\n        is_sim = n in sims\n        tag = "{0}  ({1}/{2})   step {3}/{4}".format(char, idx, total, i + 1, len(steps))\n\n        if is_sim:\n            if skip and not _hb_cache_missing(n, fa, fb):\n                _hb_status(ctrl, "SKIP     {0}  SIM     {1}  (cache already on disk)".format(tag, n.name()))\n            else:\n                _hb_status(ctrl, "RUNNING  {0}  SIM     {1}".format(tag, n.name()))\n                if n.parm("loadfromdisk") is not None:\n                    n.parm("loadfromdisk").set(0)\n                _hb_execute(n)\n            # from now on this node only READS the cache\n            if n.parm("loadfromdisk") is not None:\n                n.parm("loadfromdisk").set(1)\n            missing = _hb_cache_missing(n, fa, fb)\n            if missing:\n                raise RuntimeError("{0}: cache was not written ({1})".format(n.name(), missing))\n            continue\n\n        # export: make sure the cache above is on disk and in read mode\n        src, _ = _hb_source_cache(n, sims)\n        if src.parm("loadfromdisk") is None:\n            raise RuntimeError("{0} has no \'Load from Disk\' - cannot guarantee no re-sim".format(src.name()))\n        src.parm("loadfromdisk").set(1)\n        missing = _hb_cache_missing(src, fa, fb)\n        if missing:\n            raise RuntimeError("{0}: no cache for {1} ({2}) - not exporting to avoid a re-sim"\n                               .format(n.name(), src.name(), missing))\n        _hb_status(ctrl, "RUNNING  {0}  EXPORT  {1}  (reads {2})".format(tag, n.name(), src.name()))\n        out = _hb_out_parm(n)\n        if out is not None:\n            d = _hb_os.path.dirname(out.eval())\n            if d and not _hb_os.path.isdir(d):\n                _hb_os.makedirs(d)\n        _hb_execute(n)\n\n\ndef _hb_show_result(msg, failed):\n    try:\n        hou.ui.triggerUpdate()\n    except Exception:\n        pass\n    hou.ui.displayMessage(msg, title="Batch Hair Sim",\n                          severity=hou.severityType.Warning if failed else hou.severityType.Message)\n\n\ndef _hb_run(ctrl, chars):\n    _hb_wire_frames(ctrl)\n    if hou.hipFile.hasUnsavedChanges():\n        hou.hipFile.save()\n    done, failed = [], []\n    try:\n        with hou.InterruptableOperation("Batch Hair Sim", "Characters",\n                                        open_interrupt_dialog=True) as op:\n            for i, char in enumerate(chars):\n                op.updateLongProgress(float(i) / len(chars), "{0}  ({1}/{2})".format(char, i + 1, len(chars)))\n                try:\n                    _hb_run_char(ctrl, char, op, i + 1, len(chars))\n                    done.append(char)\n                except hou.OperationInterrupted:\n                    raise\n                except Exception as e:\n                    failed.append((char, str(e)))\n                    print("[Batch Hair] FAILED {0}: {1}".format(char, e))\n            # close the progress bar at 100% so the window goes away\n            op.updateProgress(1.0)\n            op.updateLongProgress(1.0, "Finished")\n    except hou.OperationInterrupted:\n        failed.append(("--", "cancelled by user"))\n\n    _hb_status(ctrl, "FINISHED  {0} done, {1} failed   ({2})".format(\n        len(done), len(failed), ", ".join(done) or "-"))\n    msg = "Done: {0}\\nFailed: {1}".format(", ".join(done) or "-", len(failed))\n    if failed:\n        msg += "\\n\\n" + "\\n".join("{0}: {1}".format(c, e) for c, e in failed)\n\n    # show the result only after Houdini has closed the progress window\n    try:\n        import hdefereval\n        hdefereval.executeDeferred(lambda: _hb_show_result(msg, failed))\n    except Exception:\n        _hb_show_result(msg, failed)\n\n\ndef hb_run_current(kwargs):\n    ctrl = kwargs["node"]\n    _hb_run(ctrl, [ctrl.evalParm("char")])\n\n\ndef hb_run_all(kwargs):\n    ctrl = kwargs["node"]\n    chars = _hb_selected_chars(ctrl)\n    if not chars:\n        hou.ui.displayMessage("No alembic matches \'Characters to Run\'.")\n        return\n    if hou.ui.displayMessage("Run {0} character(s)?\\n\\n{1}".format(len(chars), "\\n".join(chars)),\n                             buttons=("Run", "Cancel"), default_choice=0, close_choice=1) != 0:\n        return\n    _hb_run(ctrl, chars)\n\n\ndef _hb_resolved_path(n):\n    """Final file path a cache / ROP node will write (current frame)."""\n    for pn in ("sopoutput", "filename", "file", "outputfile"):\n        p = n.parm(pn)\n        if p is not None:\n            try:\n                v = p.eval()\n            except Exception:\n                continue\n            if v:\n                return v.replace("\\\\", "/")\n    return ""\n\n\ndef hb_check(kwargs):\n    """Dry run: show every path for the current character, nothing is written."""\n    ctrl = kwargs["node"]\n    char = ctrl.evalParm("char")\n    lines, problems = [], []\n\n    abc_file = _hb_os.path.join(ctrl.evalParm("abc_folder"), char + ".abc").replace("\\\\", "/")\n    ok = _hb_os.path.isfile(abc_file)\n    if ctrl.parm("start_frame") is not None:\n        lines.append("FRAMES  {0} - {1}".format(int(ctrl.evalParm("start_frame")),\n                                              int(ctrl.evalParm("end_frame"))))\n        lines.append("")\n    lines.append("INPUT  ({0})".format("found" if ok else "MISSING"))\n    lines.append("   " + abc_file)\n    if not ok:\n        problems.append("Alembic file is missing")\n\n    seen = {}\n    direct = _hb_is_direct(ctrl)\n    lines.append("")\n    lines.append("MODE  " + ("DIRECT - sim caches bypassed, each ROP simulates and exports"\n                             if direct else "CACHE - sim to disk first, ROPs read the cache"))\n    for title, parm_name in (("SIM CACHES" + ("  (bypassed - not written)" if direct else ""), "sim_nodes"),\n                             ("ALEMBIC EXPORTS", "export_nodes")):\n        lines.append("")\n        lines.append(title)\n        try:\n            nodes = _hb_nodes(ctrl, parm_name)\n        except Exception as e:\n            problems.append(str(e))\n            continue\n        for n in nodes:\n            path = _hb_resolved_path(n)\n            folder = _hb_os.path.dirname(path)\n            rng = ""\n            if n.parm("f1") is not None:\n                a, b = n.evalParm("f1"), n.evalParm("f2")\n                rng = "   [{0} - {1}]".format(int(a), int(b))\n                if ctrl.parm("start_frame") is not None and (\n                        int(a) != int(ctrl.evalParm("start_frame")) or\n                        int(b) != int(ctrl.evalParm("end_frame"))):\n                    problems.append("{0}: frame range {1}-{2} is not the SETUP_RUN range "\n                                    "(press Apply Frame Range)".format(n.name(), int(a), int(b)))\n            lines.append("   {0}{1}".format(n.name(), rng))\n            if parm_name == "sim_nodes" and direct:\n                continue\n            if parm_name == "export_nodes" and not direct:\n                try:\n                    sims_ = _hb_nodes(ctrl, "sim_nodes")\n                    src, connected = _hb_source_cache(n, sims_)\n                    if connected:\n                        fa, fb = _hb_frames(ctrl)\n                        has = not _hb_cache_missing(src, fa, fb)\n                        lines.append("      reads {0}  ({1})".format(\n                            src.name(), "cache on disk" if has else "no cache yet - will be simmed first"))\n                    else:\n                        problems.append("{0} is not below {1} - it would RE-SIMULATE".format(\n                            n.name(), src.name() if src else "a sim cache"))\n                except Exception as e:\n                    problems.append(str(e))\n            lines.append("      " + (path or "(could not read the output path)"))\n            if not path:\n                problems.append(n.name() + ": output path not readable")\n                continue\n            if char and char not in path:\n                problems.append(n.name() + ": path does not contain the character name")\n            key = folder if parm_name == "sim_nodes" else path\n            if key in seen:\n                problems.append("{0} and {1} write to the same {2}".format(\n                    seen[key], n.name(), "folder" if parm_name == "sim_nodes" else "file"))\n            seen[key] = n.name()\n\n    lines.append("")\n    if problems:\n        lines.append("PROBLEMS:")\n        lines += ["   - " + p for p in problems]\n        _hb_status(ctrl, "CHECK: {0} problem(s) - see the Check Paths window".format(len(problems)))\n    else:\n        lines.append("All paths are separate and use the character name.  OK to run.")\n        _hb_status(ctrl, "CHECK OK for {0} - ready to run".format(char))\n    hou.ui.displayMessage("\\n".join(lines), title="Check Paths  -  " + char,\n                          severity=hou.severityType.Warning if problems else hou.severityType.Message)\n    return not problems\n\n\ndef hb_open(kwargs, parm_name):\n    p = kwargs["node"].evalParm(parm_name)\n    if not _hb_os.path.isdir(p):\n        _hb_os.makedirs(p)\n    hou.ui.showInFileBrowser(p + "/")\n# ------------------------------------------------------------------ worker script (runs inside hython)\n_HB_WORKER_SRC = r\'\'\'# Batch Hair Sim - worker (written by SETUP_RUN, runs inside hython)\nimport argparse, os, sys, time, traceback\nimport hou\n\nap = argparse.ArgumentParser()\nap.add_argument("--hip", required=True)\nap.add_argument("--ctrl", required=True)\nap.add_argument("--char", required=True)\nap.add_argument("--rop", required=True)\na = ap.parse_args()\n\ndef log(msg):\n    print("[HairWorker] " + msg)\n    sys.stdout.flush()\n\ntry:\n    import socket\n    log("host %s  |  char %s  |  rop %s" % (socket.gethostname(), a.char, a.rop))\n    hou.hipFile.load(a.hip, suppress_save_prompt=True, ignore_load_warnings=True)\n    ctrl = hou.node(a.ctrl)\n    if ctrl is None:\n        raise RuntimeError("control node not found: " + a.ctrl)\n    ctrl.parm("char").set(a.char)\n\n    abc_in = os.path.join(ctrl.evalParm("abc_folder"), a.char + ".abc")\n    if not os.path.isfile(abc_in):\n        raise RuntimeError("input alembic missing: " + abc_in)\n\n    # Direct mode: sim caches are bypassed, the ROP simulates and writes in one pass\n    for name in ctrl.evalParm("sim_nodes").split():\n        n = ctrl.node("../" + name) or hou.node(name)\n        if n is None:\n            continue\n        p = n.parm("loadfromdisk")\n        if p is not None:\n            p.set(0)\n        n.bypass(True)\n\n    rop = ctrl.node("../" + a.rop) or hou.node(a.rop)\n    if rop is None:\n        raise RuntimeError("ROP not found: " + a.rop)\n    out_parm = None\n    for pn in ("filename", "sopoutput", "file"):\n        if rop.parm(pn) is not None:\n            out_parm = rop.parm(pn)\n            break\n    out = out_parm.eval() if out_parm is not None else ""\n    if out:\n        d = os.path.dirname(out)\n        if d and not os.path.isdir(d):\n            os.makedirs(d)\n    log("frames %d-%d  ->  %s" % (int(rop.evalParm("f1")), int(rop.evalParm("f2")), out))\n\n    t = time.time()\n    if isinstance(rop, hou.RopNode):\n        rop.render(verbose=True, output_progress=True)\n    else:\n        rop.parm("execute").pressButton()\n\n    if out and (not os.path.isfile(out) or os.path.getsize(out) == 0):\n        raise RuntimeError("output was not written: " + out)\n    log("DONE in %.1f min  ->  %s" % ((time.time() - t) / 60.0, out))\n    sys.exit(0)\nexcept SystemExit:\n    raise\nexcept Exception:\n    traceback.print_exc()\n    sys.exit(1)\n\'\'\'\n\n\ndef _hb_selected_chars(ctrl):\n    pats = ctrl.evalParm("run_chars").split() or ["*"]\n    out = []\n    for c in _hb_list_chars(ctrl):\n        inc = [p for p in pats if not p.startswith("^")]\n        exc = [p[1:] for p in pats if p.startswith("^")]\n        if any(_hb_fnmatch.fnmatch(c, p) for p in (inc or ["*"])) and \\\n                not any(_hb_fnmatch.fnmatch(c, p) for p in exc):\n            out.append(c)\n    return out\n\n\n# ------------------------------------------------------------------ background / parallel on this PC\n_hb_bg = {"thread": None, "stop": False, "procs": {}}\n\n\ndef _hb_free_ram_gb():\n    """Available physical RAM in GB (Windows), or None if unknown."""\n    try:\n        import ctypes\n\n        class _MS(ctypes.Structure):\n            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),\n                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),\n                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),\n                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),\n                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]\n        m = _MS()\n        m.dwLength = ctypes.sizeof(_MS)\n        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))\n        return m.ullAvailPhys / float(1024 ** 3)\n    except Exception:\n        return None\n\n\ndef _hb_deferred(fn):\n    try:\n        import hdefereval\n        hdefereval.executeDeferred(fn)\n    except Exception:\n        pass\n\n\ndef _hb_bg_status(ctrl_path, text):\n    def _do():\n        n = hou.node(ctrl_path)\n        if n is not None:\n            _hb_status(n, text)\n    _hb_deferred(_do)\n\n\ndef _hb_bg_loop(ctrl_path, hython, worker, hip, jobs, slots, min_free, log_dir):\n    import subprocess\n    import time\n    flags = 0\n    if _hb_os.name == "nt":\n        flags = 0x08000000 | 0x00004000      # no console window | below-normal priority (UI stays smooth)\n    queue = list(jobs)\n    running = {}                             # tag -> (Popen, logfile, t0)\n    done, failed = [], []\n    t_start = time.time()\n    total = len(jobs)\n\n    while queue or running:\n        if _hb_bg["stop"]:\n            for tag, (p, lf, _t) in running.items():\n                try:\n                    p.kill()\n                except Exception:\n                    pass\n                lf.close()\n                failed.append((tag, "stopped"))\n            running.clear()\n            failed += [("{0}_{1}".format(c, part), "not started") for c, r, part in queue]\n            queue = []\n            break\n\n        # start new jobs while there is a free slot and enough RAM\n        while queue and len(running) < slots:\n            free = _hb_free_ram_gb()\n            if running and free is not None and free < min_free:\n                break\n            char, rop_name, part = queue.pop(0)\n            tag = "{0}_{1}".format(char, part)\n            lf = open(_hb_os.path.join(log_dir, tag + ".log"), "w")\n            cmd = [hython, worker, "--hip", hip, "--ctrl", ctrl_path, "--char", char, "--rop", rop_name]\n            try:\n                p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,\n                                     cwd=_hb_os.path.dirname(hip), creationflags=flags)\n                running[tag] = (p, lf, time.time())\n                _hb_bg["procs"][tag] = p\n            except Exception as e:\n                lf.close()\n                failed.append((tag, str(e)))\n            time.sleep(3)                    # stagger start-up (scene load + license check)\n\n        for tag in list(running):\n            p, lf, t0 = running[tag]\n            if p.poll() is None:\n                continue\n            lf.close()\n            mins = (time.time() - t0) / 60.0\n            if p.returncode == 0:\n                done.append("{0}  ({1:.0f} min)".format(tag, mins))\n            else:\n                failed.append((tag, "exit code {0} - see logs/{1}.log".format(p.returncode, tag)))\n            del running[tag]\n            _hb_bg["procs"].pop(tag, None)\n\n        free = _hb_free_ram_gb()\n        _hb_bg_status(ctrl_path, "BACKGROUND  {0}/{1} done  |  running: {2}  |  queued {3}  |  "\n                                 "failed {4}{5}".format(\n                                     len(done), total, ", ".join(sorted(running)) or "-", len(queue),\n                                     len(failed), "  |  free RAM {0:.0f} GB".format(free) if free else ""))\n        time.sleep(5)\n\n    mins = (time.time() - t_start) / 60.0\n    summary = "Background sims finished in {0:.0f} min\\n\\nDone: {1}\\nFailed: {2}".format(\n        mins, len(done), len(failed))\n    if done:\n        summary += "\\n\\n" + "\\n".join(done)\n    if failed:\n        summary += "\\n\\nFAILED:\\n" + "\\n".join("{0}: {1}".format(t, e) for t, e in failed)\n    with open(_hb_os.path.join(log_dir, "_summary.txt"), "w") as f:\n        f.write(summary)\n    _hb_bg["thread"] = None\n    _hb_bg["stop"] = False\n    _hb_bg_status(ctrl_path, "BACKGROUND FINISHED  {0} done, {1} failed  ({2:.0f} min)".format(\n        len(done), len(failed), mins))\n    _hb_deferred(lambda: hou.ui.displayMessage(\n        summary, title="Batch Hair Sim - Background",\n        severity=hou.severityType.Warning if failed else hou.severityType.Message))\n\n\ndef hb_bg_run(kwargs):\n    import threading\n    ctrl = kwargs["node"]\n    if _hb_bg["thread"] is not None and _hb_bg["thread"].is_alive():\n        hou.ui.displayMessage("Background sims are already running. Press Stop first.")\n        return\n\n    chars = _hb_selected_chars(ctrl)\n    rops = _hb_nodes(ctrl, "export_nodes")\n    if not chars:\n        hou.ui.displayMessage("No alembic matches \'Characters to Run\'.")\n        return\n    missing = [c for c in chars if not _hb_os.path.isfile(\n        _hb_os.path.join(ctrl.evalParm("abc_folder"), c + ".abc"))]\n    if missing:\n        hou.ui.displayMessage("Input alembic missing for:\\n" + "\\n".join(missing))\n        return\n\n    slots = int(ctrl.evalParm("bg_slots"))\n    min_free = float(ctrl.evalParm("bg_min_ram"))\n    hython = _hb_expand("$HFS").replace("\\\\", "/") + "/bin/" + ("hython.exe" if _hb_os.name == "nt" else "hython")\n    if not _hb_os.path.isfile(hython):\n        hou.ui.displayMessage("hython not found:\\n" + hython)\n        return\n\n    jobs = [(c, r.name(), _hb_part(r)) for c in chars for r in rops]\n    if hou.ui.displayMessage(\n            "Run {0} sims in the background ({1} characters x {2} parts)?\\n\\n"\n            "{3} at the same time  |  frames {4}-{5}\\n"\n            "A new sim only starts if at least {6:.0f} GB RAM is free.\\n\\n"\n            "Keep this Houdini open until it finishes - you can keep working meanwhile."\n            .format(len(jobs), len(chars), len(rops), slots, int(ctrl.evalParm("start_frame")),\n                    int(ctrl.evalParm("end_frame")), min_free),\n            buttons=("Start", "Cancel"), default_choice=0, close_choice=1,\n            title="Run in Background") != 0:\n        return\n\n    _hb_wire_frames(ctrl)\n    hou.hipFile.save()\n    hip = hou.hipFile.path()\n\n    base = _hb_os.path.join(_hb_expand("$HIP"), "local_farm")\n    log_dir = _hb_os.path.join(base, "logs")\n    if not _hb_os.path.isdir(log_dir):\n        _hb_os.makedirs(log_dir)\n    worker = _hb_os.path.join(base, "hair_worker.py").replace("\\\\", "/")\n    with open(worker, "w") as f:\n        f.write(_HB_WORKER_SRC)\n\n    _hb_bg["stop"] = False\n    t = threading.Thread(target=_hb_bg_loop,\n                         args=(ctrl.path(), hython, worker, hip, jobs, slots, min_free, log_dir))\n    t.daemon = True\n    _hb_bg["thread"] = t\n    t.start()\n    _hb_status(ctrl, "BACKGROUND  starting {0} sims, {1} at a time...".format(len(jobs), slots))\n\n\ndef hb_bg_stop(kwargs):\n    if _hb_bg["thread"] is None:\n        hou.ui.displayMessage("Nothing is running in the background.")\n        return\n    if hou.ui.displayMessage("Stop all background sims? Running sims are killed (their output is incomplete).",\n                             buttons=("Stop", "Cancel"), default_choice=1, close_choice=1) == 0:\n        _hb_bg["stop"] = True\n\n\ndef hb_bg_logs(kwargs):\n    p = _hb_os.path.join(_hb_expand("$HIP"), "local_farm", "logs")\n    if not _hb_os.path.isdir(p):\n        _hb_os.makedirs(p)\n    hou.ui.showInFileBrowser(p.replace("\\\\", "/") + "/")\n# <<< HAIR_BATCH\n'
+
+
+def _install_session_code():
+    src = hou.sessionModuleSource() or ""
+    src = re.sub(r"# >>> HAIR_BATCH.*?# <<< HAIR_BATCH\n?", "", src, flags=re.S).rstrip()
+    if "import hou" not in src:
+        src = "import hou\n" + src
+    hou.setSessionModuleSource(src + "\n\n" + SESSION_SRC)
+
+
+def _cb(fn):
+    return "hou.session.{0}(kwargs)".format(fn)
+
+
+def _build_parms(ctrl):
+    ptg = ctrl.parmTemplateGroup()
+    names = ("hb_folder", "hb_step1", "hb_step2", "hb_step3", "hb_ro", "status",
+             "abc_folder", "char", "abc_path", "abc_node", "cache_root", "sim_nodes",
+             "cache_preview", "export_root", "export_nodes", "export_preview", "wire",
+             "run_chars", "run_mode", "skip_cached", "check", "run_current", "run_all", "open_cache", "open_export",
+             "start_frame", "end_frame", "set_solver_start", "set_timeline", "frames_tl", "frames_apply", "sep4", "sep5",
+             "hb_step4", "lbl4", "bg_slots", "bg_min_ram", "bg_run", "bg_stop", "bg_logs", "dl_group", "dl_machines", "dl_pool", "dl_limits", "dl_priority",
+             "dl_hython", "dl_cmd", "dl_defaults", "dl_submit",
+             "lbl_in", "lbl1", "lbl2", "lbl3", "sep1", "sep2", "sep3")
+    for name in names:
+        if ptg.find(name):
+            ptg.remove(name)
+
+    S = hou.StringParmTemplate
+    PY = hou.scriptLanguage.Python
+    RO = "{ hb_ro == 0 }"            # read-only display fields
+
+    def note(name, text):
+        return hou.LabelParmTemplate(name, "", column_labels=[text], is_label_hidden=True)
+
+    def button(name, label, cb, join=False):
+        b = hou.ButtonParmTemplate(name, label, script_callback=cb, script_callback_language=PY)
+        b.setJoinWithNext(join)
+        return b
+
+    def readonly(name, label, value):
+        p = S(name, label, 1, default_value=[value])
+        p.setDisableWhen(RO)
+        return p
+
+    top = hou.FolderParmTemplate("hb_folder", "Batch Hair Sim", folder_type=hou.folderType.Tabs)
+
+    hidden = hou.ToggleParmTemplate("hb_ro", "ro", default_value=False)
+    hidden.hide(True)
+    top.addParmTemplate(hidden)
+
+    # ---------------------------------------------------------------- status
+    top.addParmTemplate(readonly("status", "Status", "Idle - pick a character in step 1"))
+
+    # ---------------------------------------------------------------- step 1
+    f1 = hou.FolderParmTemplate("hb_step1", "STEP 1  -  Pick Character  (input from Maya)",
+                                folder_type=hou.folderType.Simple)
+    f1.addParmTemplate(note("lbl1", "Choose a character: its alembic is loaded right away, "
+                                    "and all caches below point to its own folder."))
+    f1.addParmTemplate(S("abc_folder", "Alembic Folder", 1, default_value=["$HIP"],
+                         string_type=hou.stringParmType.FileReference,
+                         file_type=hou.fileType.Directory))
+    f1.addParmTemplate(S("char", "Character", 1, default_value=[""],
+                         item_generator_script="hou.session.hb_char_menu(kwargs)",
+                         item_generator_script_language=PY, menu_type=hou.menuType.Normal))
+    f1.addParmTemplate(readonly("abc_path", "Reading", '`chs("abc_folder")`/`chs("char")`.abc'))
+    f1.addParmTemplate(S("abc_node", "Alembic SOP", 1, default_value=[ABC_NODE_DEFAULT],
+                         string_type=hou.stringParmType.NodeReference))
+    top.addParmTemplate(f1)
+
+    # ---------------------------------------------------------------- step 2
+    f2 = hou.FolderParmTemplate("hb_step2", "STEP 2  -  Output Paths  (set once per shot)",
+                                folder_type=hou.folderType.Simple)
+    f2.addParmTemplate(note("lbl2", "Paths and frame range for every cache and ROP. "
+                                    "After changing anything here press Apply."))
+    f2.addParmTemplate(S("cache_root", "Sim Cache Root", 1, default_value=["$HIP/cache"],
+                         string_type=hou.stringParmType.FileReference,
+                         file_type=hou.fileType.Directory))
+    f2.addParmTemplate(S("sim_nodes", "Sim Caches", 1, default_value=[SIM_DEFAULT]))
+    f2.addParmTemplate(readonly("cache_preview", "  -> writes to",
+                                '`chs("cache_root")`/`chs("char")`/<part>/'))
+    f2.addParmTemplate(hou.SeparatorParmTemplate("sep2"))
+    f2.addParmTemplate(S("export_root", "Export Root (Maya)", 1, default_value=["$HIP/from_houdini"],
+                         string_type=hou.stringParmType.FileReference,
+                         file_type=hou.fileType.Directory))
+    f2.addParmTemplate(S("export_nodes", "Alembic ROPs", 1, default_value=[EXPORT_DEFAULT]))
+    f2.addParmTemplate(readonly("export_preview", "  -> writes to",
+                                '`chs("export_root")`/`chs("char")`/<part>.abc'))
+    f2.addParmTemplate(hou.SeparatorParmTemplate("sep4"))
+    fr = hou.FloatParmTemplate("start_frame", "Start Frame", 1, default_value=[950],
+                               min=0, max=2000, min_is_strict=False, max_is_strict=False)
+    fr.setJoinWithNext(True)
+    f2.addParmTemplate(fr)
+    f2.addParmTemplate(hou.FloatParmTemplate("end_frame", "End", 1, default_value=[1103],
+                                             min=0, max=2000, min_is_strict=False,
+                                             max_is_strict=False))
+    f2.addParmTemplate(hou.ToggleParmTemplate("set_solver_start", "Vellum Solver starts at Start Frame",
+                                              default_value=True))
+    f2.addParmTemplate(hou.ToggleParmTemplate("set_timeline", "Set Houdini timeline to this range",
+                                              default_value=True))
+    f2.addParmTemplate(button("frames_tl", "Get From Timeline",
+                              "hou.session.hb_frames_from_timeline(kwargs)", join=True))
+    f2.addParmTemplate(button("frames_apply", "Apply Frame Range",
+                              "hou.session.hb_apply_frames(kwargs)"))
+    f2.addParmTemplate(hou.SeparatorParmTemplate("sep5"))
+    f2.addParmTemplate(button("wire", "Apply Paths + Frames to Nodes", "hou.session.hb_wire(kwargs)"))
+    top.addParmTemplate(f2)
+
+    # ---------------------------------------------------------------- step 3
+    f3 = hou.FolderParmTemplate("hb_step3", "STEP 3  -  Run",
+                                folder_type=hou.folderType.Simple)
+    f3.addParmTemplate(note("lbl3", "Direct mode: per character only the 3 alembic ROPs run (each one simulates)."
+                                    " Press Check Paths first, then test one with Run Current."))
+    f3.addParmTemplate(S("run_chars", "Characters to Run", 1, default_value=["*"],
+                         help="Space separated patterns. * = all, e.g.  wildebeest_*  ^zebra_01"))
+    f3.addParmTemplate(hou.MenuParmTemplate(
+        "run_mode", "Run Mode",
+        menu_items=("direct", "cache"),
+        menu_labels=("Direct: ROP sims + exports  (no sim cache)",
+                      "Cache: sim to disk first, ROP reads the cache"),
+        default_value=0))
+    sk = hou.ToggleParmTemplate("skip_cached",
+                                "Skip sim if its cache already exists (export only)",
+                                default_value=False)
+    sk.setConditional(hou.parmCondType.HideWhen, "{ run_mode == direct }")
+    f3.addParmTemplate(sk)
+    f3.addParmTemplate(button("check", "Check Paths (dry run)", "hou.session.hb_check(kwargs)"))
+    f3.addParmTemplate(button("run_current", "Run Current Character",
+                              "hou.session.hb_run_current(kwargs)", join=True))
+    f3.addParmTemplate(button("run_all", ">>  RUN ALL CHARACTERS  <<", "hou.session.hb_run_all(kwargs)"))
+    f3.addParmTemplate(hou.SeparatorParmTemplate("sep3"))
+    f3.addParmTemplate(button("open_cache", "Open Cache Folder",
+                              'hou.session.hb_open(kwargs, "cache_root")', join=True))
+    f3.addParmTemplate(button("open_export", "Open from_houdini Folder",
+                              'hou.session.hb_open(kwargs, "export_root")'))
+    top.addParmTemplate(f3)
+
+    # ---------------------------------------------------------------- step 4
+    f4 = hou.FolderParmTemplate("hb_step4", "STEP 4  -  Run in Background  (several sims at once on this PC)",
+                                folder_type=hou.folderType.Simple)
+    f4.addParmTemplate(note("lbl4", "Runs the same jobs as RUN ALL, but in the background and in parallel. "
+                                    "Houdini stays free. Uses Characters to Run from Step 3."))
+    f4.addParmTemplate(hou.IntParmTemplate("bg_slots", "Sims at the same time", 1, default_value=[4],
+                                           min=1, max=8, min_is_strict=True))
+    f4.addParmTemplate(hou.FloatParmTemplate("bg_min_ram", "Min free RAM to start (GB)", 1,
+                                             default_value=[12], min=2, max=64))
+    f4.addParmTemplate(button("bg_run", ">>  RUN IN BACKGROUND  <<", "hou.session.hb_bg_run(kwargs)"))
+    f4.addParmTemplate(button("bg_stop", "Stop", "hou.session.hb_bg_stop(kwargs)", join=True))
+    f4.addParmTemplate(button("bg_logs", "Open Logs", "hou.session.hb_bg_logs(kwargs)"))
+    top.addParmTemplate(f4)
+
+    ptg.append(top)
+    ctrl.setParmTemplateGroup(ptg)
+
+    # parms with the same name keep their old values - reset the display fields
+    for name in ("abc_path", "cache_preview", "export_preview", "status"):
+        p = ctrl.parm(name)
+        if p is not None:
+            p.deleteAllKeyframes()
+            p.revertToDefaults()
+
+
+def install():
+    if not hou.hipFile.path() or hou.hipFile.basename().startswith("untitled"):
+        hou.ui.displayMessage("Save the hip file first (alembics are read from $HIP).",
+                              severity=hou.severityType.Warning)
+        return
+    ctrl = hou.node(CTRL_DEFAULT)
+    if ctrl is None:
+        sel = hou.selectedNodes()
+        if not sel:
+            hou.ui.displayMessage("Control null not found:\n{0}\n\nSelect your control null and run again."
+                                  .format(CTRL_DEFAULT), severity=hou.severityType.Warning)
+            return
+        ctrl = sel[0]
+
+    _install_session_code()
+    _build_parms(ctrl)
+
+    chars = hou.session._hb_list_chars(ctrl)
+    if chars and not ctrl.evalParm("char"):
+        ctrl.parm("char").set(chars[0])
+
+    try:
+        report = hou.session.hb_wire({"node": ctrl})
+        wired = "\n".join(report)
+    except Exception as e:
+        wired = "Could not wire nodes yet:\n{0}\n\nFix the node names on SETUP_RUN and press " \
+                "'Apply Paths to Nodes'.".format(e)
+
+    ctrl.setSelected(True, clear_all_selected=True)
+    hou.ui.displayMessage("SETUP_RUN is ready.\n\n{0} alembic(s) found in $HIP\n\n{1}".format(
+        len(chars), wired), title="Batch Hair Sim")
+
+
+install()
+]]></scriptCode>
+      </scriptItem>
+
+    </subMenu>
+
+  </menuBar>
+</mainMenu>
