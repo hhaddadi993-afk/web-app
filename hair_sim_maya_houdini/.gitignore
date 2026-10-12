@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+local_farm/
+*.hip
+*.hiplc
+*.hipnc
+*.bgeo.sc
