@@ -25,6 +25,9 @@ XGen collection namespace.** Part name comes from the Houdini node name:
 
 | Path | What |
 |---|---|
+| `install.py` | Run once (`python install.py`, `--dry-run`, `--uninstall`): writes marked `MY_PIPELINE` blocks into Maya.env + userSetup.py and a Houdini package json (hpath = `houdini/`). Menus then load from THIS folder |
+| `maya/my_tools_maya.py` | Builds the Maya "My Tools" menu from the `TOOLS` list (one line per tool; reloads the module on every click) |
+| `maya/mi_to_hair.py` | Finds `_mi_` namespaces, locates `<id>_hair_fn.mb` under `Assets_FN/characters`, swaps the reference (namespace first), verifies XGen collections vs `.xgen` files. Reuses `char_pipeline_tool` |
 | `maya/char_pipeline_tool.py` | Maya plug-in: rest->anim transition, swap _lo_/_mi_ version, replace with file, XGen-safe namespace rename |
 | `maya/abc_export_by_namespace.py` | **NOT IN THIS REPO YET** - PySide2 window, one .abc per top namespace into `<scene dir>/from_maya/`; start 950, end = last frame of `cam_XXXX_YYYY` +1 |
 | `maya/xgen_assign_houdini_cache.py` | **NOT IN THIS REPO YET** - sets cacheFileName/useCache/liveMode per XGen description from `from_houdini/<char>/*.abc` (longest part-name match) |
@@ -34,6 +37,10 @@ XGen collection namespace.** Part name comes from the Houdini node name:
 | `houdini/src/my_tools_save_hip_clipboard.py` | Menu item: save hip into clipboard folder as `<shot>_hair_sim_v###.hip` (auto version) |
 | `houdini/src/install_template.py` | Menu item "Batch Hair Sim: Setup SETUP_RUN"; embeds `session_code.py` (placeholder `__SESSION_SRC__`), builds the SETUP_RUN UI |
 | `houdini/src/session_code.py` | All runtime logic (`hou.session.hb_*(kwargs)`), written into the hip's Session Module between `# >>> HAIR_BATCH` / `# <<< HAIR_BATCH` |
+
+## Naming (Maya assets)
+Anim rig file/namespace `####_#_mi_rig_fn` -> hair file `####_#_hair_fn.mb` (own folder under `Maya/Assets_FN/characters/...hair...`).
+After Mi->Hair the namespace is the hair file name (+ trailing number of the old one).
 
 ## SETUP_RUN (tab "Batch Hair Sim")
 1. Pick Character - abc_folder ($HIP), char, abc_node
